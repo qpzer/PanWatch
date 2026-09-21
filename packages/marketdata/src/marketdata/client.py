@@ -159,7 +159,9 @@ class MarketData:
         out: list[Quote] = []
         for mkt, syms in groups.items():
             req = Request(symbols=tuple(s.code for s in syms), market=mkt)
-            resp = self._quote_engine.fetch(req)
+            # min_count=全量:部分源只覆盖部分标的时(如腾讯无 800005 统计指标)，
+            # 继续降级到能覆盖全量的源，避免批量请求里特殊标的被静默丢弃
+            resp = self._quote_engine.fetch(req, min_count=len(syms))
             if resp.ok and resp.data:
                 out.extend(resp.data)
         return out
