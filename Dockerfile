@@ -85,15 +85,15 @@ COPY requirements.txt ./
 # 复制本仓内本地包(requirements.txt 里 -e ./packages/marketdata 需要它先在)
 COPY packages/ ./packages/
 
-# 本地构建：tradingagents 的 wheel 已 vendor 到仓内（PyPI 包要求 >=3.12，镜像为 3.11，
-# 用 --ignore-requires-python 跳过元数据校验；wheel 为纯 Python，3.11 运行无差异）
+# 本地构建：tradingagents 源码已 vendor 到仓内（GitHub 直连不稳定；
+# PyPI 同名包源码不同且用了 Python 3.12 语法，与 3.11 镜像不兼容，必须用 tag 源码）
 COPY vendor/ ./vendor/
 
 # 安装 Python 依赖
 # 本地构建：PyPI 官方源国内不稳定，切清华 TUNA 镜像
 RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
     && pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir --ignore-requires-python ./vendor/tradingagents-0.4.0-py3-none-any.whl
+    && pip install --no-cache-dir ./vendor/TradingAgents
 
 # 注意: Playwright 浏览器将在首次启动时自动安装到 data 目录
 # 这样可以减小镜像体积，并支持跨版本持久化
