@@ -30,9 +30,9 @@ xhtml2pdf>=0.2.17
 # checkpoint 恢复可靠性,并新增 max_tokens/llm_max_retries 配置。适配层依赖的
 # route_to_vendor/load_ohlcv/get_graph_args/create_initial_state 仍保持签名稳定;
 # 唯一行为变更是上游无法解析评级时返回 REVIEW,由 result_mapper 显式展示为“待人工复核”。
-# 本地构建：GitHub 直连不稳定且 PyPI 包要求 >=3.12(镜像是 3.11)，
-# 改为 vendor/ 里的 0.4.0 wheel(Pure Python)，在 Dockerfile 中显式安装。
-# tradingagents==0.4.0
+# 本地构建：GitHub 直连不稳定，改为 vendor/TradingAgents 目录安装（v0.4.0 tag 源码，
+# requires-python>=3.10，与官方镜像构建一致；PyPI 的 tradingagents 包是另一套源码，勿用）。
+# 原依赖声明：tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@v0.4.0
 
 # 本仓内独立行情数据包(editable 本地安装;发 PyPI 前不占外部依赖)
 -e ./packages/marketdata
