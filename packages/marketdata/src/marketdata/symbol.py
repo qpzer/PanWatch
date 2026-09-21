@@ -68,4 +68,7 @@ class Symbol:
             return f"116.{self.code}"
         if self.market == Market.US:
             return f"105.{self.code}"
+        if self.code.startswith("800"):
+            # 东财市场统计指标 800xxx 族（全A指数、A股平均股价等），secid 固定 47 号市场
+            return f"47.{self.code}"
         return f"{'1' if _cn_exchange(self.code) == 'sh' else '0'}.{self.code}"
