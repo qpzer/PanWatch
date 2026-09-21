@@ -11,7 +11,7 @@ from src.modules.automation.tradingagents import auto_trigger
 
 def _make_agent(raw_config: dict):
     agent = MagicMock()
-    agent.raw_config = raw_config
+    agent.config = raw_config
     return agent
 
 
