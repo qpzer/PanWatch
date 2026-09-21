@@ -32,6 +32,9 @@ WORKDIR /app
 # - tzdata: 时区数据（zoneinfo 模块需要）
 # - 中文字体（K线截图需要）
 # - Playwright Chromium 依赖的系统库
+# 本地构建：Debian 官方源在国内几乎不可达，先切清华 TUNA 镜像
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
     # git: requirements.txt 中含 git+https 直链(tradingagents)
@@ -82,8 +85,15 @@ COPY requirements.txt ./
 # 复制本仓内本地包(requirements.txt 里 -e ./packages/marketdata 需要它先在)
 COPY packages/ ./packages/
 
+# 本地构建：tradingagents 的 wheel 已 vendor 到仓内（PyPI 包要求 >=3.12，镜像为 3.11，
+# 用 --ignore-requires-python 跳过元数据校验；wheel 为纯 Python，3.11 运行无差异）
+COPY vendor/ ./vendor/
+
 # 安装 Python 依赖
-RUN pip install --no-cache-dir -r requirements.txt
+# 本地构建：PyPI 官方源国内不稳定，切清华 TUNA 镜像
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir --ignore-requires-python ./vendor/tradingagents-0.4.0-py3-none-any.whl
 
 # 注意: Playwright 浏览器将在首次启动时自动安装到 data 目录
 # 这样可以减小镜像体积，并支持跨版本持久化
