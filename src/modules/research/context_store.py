@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy import and_
 
-from src.platform.persistence.database import SessionLocal
+from src.platform.persistence.database import SessionLocal, run_with_lock_retry
 from src.platform.persistence.models import (
     AgentContextRun,
     AgentPredictionOutcome,
@@ -172,6 +172,31 @@ def save_agent_context_run(
     context_payload: dict,
     quality: dict | None = None,
 ) -> bool:
+    try:
+        run_with_lock_retry(
+            lambda: _save_agent_context_run_once(
+                agent_name=agent_name,
+                stock_symbol=stock_symbol,
+                analysis_date=analysis_date,
+                context_payload=context_payload,
+                quality=quality,
+            ),
+            label=f"保存 agent context run({agent_name}/{stock_symbol})",
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"保存 agent context run 失败: {e}")
+        return False
+
+
+def _save_agent_context_run_once(
+    *,
+    agent_name: str,
+    stock_symbol: str,
+    analysis_date: str,
+    context_payload: dict,
+    quality: dict | None,
+) -> None:
     db = SessionLocal()
     try:
         payload_safe = to_jsonable(context_payload or {})
@@ -186,11 +211,9 @@ def save_agent_context_run(
             )
         )
         db.commit()
-        return True
-    except Exception as e:
-        logger.warning(f"保存 agent context run 失败: {e}")
+    except Exception:
         db.rollback()
-        return False
+        raise
     finally:
         db.close()
 
@@ -231,6 +254,45 @@ def save_agent_prediction_outcome(
     trigger_price: float | None = None,
     meta: dict | None = None,
 ) -> bool:
+    try:
+        run_with_lock_retry(
+            lambda: _save_agent_prediction_outcome_once(
+                agent_name=agent_name,
+                stock_symbol=stock_symbol,
+                stock_market=stock_market,
+                prediction_date=prediction_date,
+                horizon_days=horizon_days,
+                action=action,
+                action_label=action_label,
+                prediction_group_id=prediction_group_id,
+                horizon_unit=horizon_unit,
+                confidence=confidence,
+                trigger_price=trigger_price,
+                meta=meta,
+            ),
+            label=f"保存 prediction outcome({agent_name}/{stock_symbol})",
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"保存 prediction outcome 失败: {e}")
+        return False
+
+
+def _save_agent_prediction_outcome_once(
+    *,
+    agent_name: str,
+    stock_symbol: str,
+    stock_market: str,
+    prediction_date: str,
+    horizon_days: int,
+    action: str,
+    action_label: str,
+    prediction_group_id: str | None,
+    horizon_unit: str,
+    confidence: float | None,
+    trigger_price: float | None,
+    meta: dict | None,
+) -> None:
     db = SessionLocal()
     try:
         meta_safe = to_jsonable(meta or {})
@@ -252,11 +314,9 @@ def save_agent_prediction_outcome(
             )
         )
         db.commit()
-        return True
-    except Exception as e:
-        logger.warning(f"保存 prediction outcome 失败: {e}")
+    except Exception:
         db.rollback()
-        return False
+        raise
     finally:
         db.close()
 

@@ -6,7 +6,7 @@ from typing import Optional
 from datetime import timezone
 from sqlalchemy import and_, func, or_
 
-from src.platform.persistence.database import SessionLocal
+from src.platform.persistence.database import SessionLocal, run_with_lock_retry
 from src.platform.persistence.models import StockSuggestion
 from src.platform.scheduling.timezone import utc_now, to_iso_with_tz
 from src.platform.persistence.json_safe import to_jsonable
@@ -78,6 +78,48 @@ def save_suggestion(
     Returns:
         是否保存成功
     """
+    try:
+        run_with_lock_retry(
+            lambda: _save_suggestion_once(
+                stock_symbol=stock_symbol,
+                stock_name=stock_name,
+                action=action,
+                action_label=action_label,
+                agent_name=agent_name,
+                signal=signal,
+                reason=reason,
+                agent_label=agent_label,
+                expires_hours=expires_hours,
+                prompt_context=prompt_context,
+                ai_response=ai_response,
+                stock_market=stock_market,
+                meta=meta,
+            ),
+            label=f"保存建议({agent_name}/{stock_symbol})",
+        )
+        return True
+    except Exception as e:
+        logger.error(f"保存建议失败: {e}")
+        return False
+
+
+def _save_suggestion_once(
+    *,
+    stock_symbol: str,
+    stock_name: str,
+    action: str,
+    action_label: str,
+    agent_name: str,
+    signal: str,
+    reason: str,
+    agent_label: str,
+    expires_hours: Optional[int],
+    prompt_context: str,
+    ai_response: str,
+    stock_market: str,
+    meta: dict | None,
+) -> None:
+    """save_suggestion 的单次执行体，异常向上抛由调用方决定是否重试。"""
     db = SessionLocal()
     try:
         market = (stock_market or "CN").strip().upper() or "CN"
@@ -185,12 +227,10 @@ def save_suggestion(
         db.commit()
 
         logger.info(f"保存建议: {stock_symbol} {action_label} (来源: {agent_label})")
-        return True
 
-    except Exception as e:
-        logger.error(f"保存建议失败: {e}")
+    except Exception:
         db.rollback()
-        return False
+        raise
     finally:
         db.close()
 

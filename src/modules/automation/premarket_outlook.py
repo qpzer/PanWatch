@@ -921,6 +921,11 @@ class PremarketOutlookAgent(BaseAgent):
             )
         else:
             logger.error("[%s] 盘前分析保存历史记录失败", trace_id)
+            # 落库失败不能只留在日志里：通知照常发出会让"通知成功"掩盖"历史缺失"。
+            # 在推送内容末尾追加醒目提示，让用户当天就能发现异常。
+            result.content = (
+                result.content or ""
+            ) + "\n\n---\n> ⚠️ 本次分析结果写入历史记录失败（数据库繁忙），分析历史页面可能缺少本条记录，请查看服务日志。"
         logger.info(
             "[%s] 盘前分析完成: elapsed_ms=%s",
             trace_id,
