@@ -64,6 +64,17 @@ EASTMONEY_BJ_PARAMS = {
     "fs": "m:0+t:81",  # 北交所
     "fields": "f12,f14",
 }
+
+# 东方财富场内基金参数（ETF/LOF，b:MK0021-24 覆盖全部场内基金）
+EASTMONEY_ETF_PARAMS = {
+    "po": "1",
+    "np": "1",
+    "fltt": "2",
+    "invt": "2",
+    "fid": "f12",
+    "fs": "b:MK0021,b:MK0022,b:MK0023,b:MK0024",
+    "fields": "f12,f14",
+}
 PAGE_SIZE = 100
 
 
@@ -245,6 +256,43 @@ def _fetch_us_from_eastmoney() -> list[dict]:
     return stocks
 
 
+def _fetch_etf_page(client: httpx.Client, page: int) -> list[dict]:
+    """获取东方财富场内基金列表的单页"""
+    params = {**EASTMONEY_ETF_PARAMS, "pn": str(page), "pz": str(PAGE_SIZE)}
+    resp = client.get(EASTMONEY_URL, params=params, timeout=30, follow_redirects=True)
+    data = resp.json()
+    diff = data.get("data") or {}
+    items = diff.get("diff") or []
+    return [{"symbol": str(item["f12"]), "name": str(item["f14"]), "market": "CN"} for item in items]
+
+
+def _fetch_etf_from_eastmoney() -> list[dict]:
+    """东方财富场内基金（ETF/LOF）列表"""
+    with httpx.Client(follow_redirects=True, headers=HEADERS, timeout=30) as client:
+        params = {**EASTMONEY_ETF_PARAMS, "pn": "1", "pz": str(PAGE_SIZE)}
+        resp = client.get(EASTMONEY_URL, params=params)
+        data = resp.json()
+        root = data.get("data") or {}
+        total = root.get("total", 0)
+        first_items = root.get("diff") or []
+
+        stocks = [{"symbol": str(item["f12"]), "name": str(item["f14"]), "market": "CN"} for item in first_items]
+
+        if total <= PAGE_SIZE:
+            return stocks
+
+        pages_needed = (total + PAGE_SIZE - 1) // PAGE_SIZE
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_fetch_etf_page, client, pn): pn for pn in range(2, pages_needed + 1)}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    stocks.extend(future.result())
+                except Exception as e:
+                    logger.warning(f"东方财富场内基金第 {futures[future]} 页获取失败: {e}")
+
+    return stocks
+
+
 def _fetch_from_akshare() -> list[dict]:
     """akshare 数据源（备用，可能有 SSL 问题）"""
     import akshare as ak
@@ -306,6 +354,14 @@ def refresh_stock_list() -> list[dict]:
     except Exception as e:
         logger.warning(f"东方财富获取北交所失败: {e}")
 
+    # 场内基金(ETF/LOF): 东方财富
+    try:
+        etf_stocks = _fetch_etf_from_eastmoney()
+        stocks.extend(etf_stocks)
+        logger.info(f"东方财富获取场内基金列表成功: {len(etf_stocks)} 只")
+    except Exception as e:
+        logger.warning(f"东方财富获取场内基金失败: {e}")
+
     if stocks:
         _save_cache(stocks)
     return stocks
@@ -317,6 +373,21 @@ def get_stock_list() -> list[dict]:
     if cached:
         return cached
     return refresh_stock_list()
+
+
+# 场内基金代码前缀（沪: 50/51/52/56/58 封闭式/ETF；深: 15/16/18 ETF/LOF）
+_EXCHANGE_FUND_PREFIXES = ("50", "51", "52", "56", "58", "15", "16", "18")
+
+
+def _is_exchange_traded_fund(code: str, mkt_num: str) -> bool:
+    """是否场内基金（ETF/LOF 等有场内行情的基金），用于搜索收录过滤。
+
+    东财 suggest 对基金的 SecurityTypeName 只给"基金"，无法区分场内/场外；
+    场外基金（000/00/11 开头等）没有场内行情，不能当标的收录。
+    """
+    if mkt_num not in ("0", "1"):  # 0=深, 1=沪；其余为场外/货币等板块
+        return False
+    return code.startswith(_EXCHANGE_FUND_PREFIXES)
 
 
 def _realtime_search(query: str, market: str = "", limit: int = 20) -> list[dict]:
@@ -366,12 +437,18 @@ def _realtime_search(query: str, market: str = "", limit: int = 20) -> list[dict
             or code_raw.startswith("BJ")
         ):
             stock_market = "CN"
+        elif classify == "Fund" and _is_exchange_traded_fund(
+            code_raw, (item.get("MktNum") or "").strip()
+        ):
+            # 场内基金（ETF/LOF 等）：有场内实时行情，按 CN 标的收录；
+            # 场外基金无场内行情，由 _is_exchange_traded_fund 排除
+            stock_market = "CN"
         elif classify == "HKStock" or "港" in security_type:
             stock_market = "HK"
         elif classify == "UsStock" or "美" in security_type:
             stock_market = "US"
         else:
-            continue  # 跳过其他类型（债券、基金等）
+            continue  # 跳过其他类型（债券、场外基金等）
 
         # 市场筛选
         if market and stock_market != market:
