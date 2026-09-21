@@ -51,6 +51,9 @@ scheduler: AgentScheduler | None = None
 price_alert_scheduler: PriceAlertScheduler | None = None
 paper_trading_scheduler: PaperTradingScheduler | None = None
 context_maintenance_scheduler: ContextMaintenanceScheduler | None = None
+# 主事件循环句柄:reload_scheduler 会被无线程事件循环的同步 API(线程池)调用,
+# 此时需要借助主循环完成新调度器的启动。
+_MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
 
 def apply_proxy_env(proxy: str | None) -> None:
@@ -1169,9 +1172,19 @@ def register_mcp_log_cleanup(sched: AgentScheduler) -> None:
     logger.info("MCP 日志保留期清理任务已注册")
 
 
+async def _start_scheduler_on_loop(sched: AgentScheduler):
+    """在主事件循环线程内启动调度器(AsyncIOScheduler.start 依赖 running loop)"""
+    sched.start()
+
+
 def reload_scheduler() -> bool:
-    """重载调度器（用于配置导入/批量修改后立即生效）"""
-    global scheduler
+    """重载调度器（用于配置导入/批量修改后立即生效）
+
+    同步 API 在线程池中执行,当前线程没有 running event loop,而
+    AsyncIOScheduler.start() 依赖 running loop,直接启动会失败并导致
+    “旧调度器已关闭、新调度器未启动”的空窗。捕获该异常后回退到主事件循环启动。
+    """
+    global scheduler, _MAIN_LOOP
     try:
         current = globals().get("scheduler")
         if current:
@@ -1180,7 +1193,16 @@ def reload_scheduler() -> bool:
             except Exception:
                 pass
         scheduler = build_scheduler()
-        scheduler.start()
+        try:
+            scheduler.start()
+        except RuntimeError:
+            loop = _MAIN_LOOP
+            if loop is None or loop.is_closed():
+                raise
+            fut = asyncio.run_coroutine_threadsafe(
+                _start_scheduler_on_loop(scheduler), loop
+            )
+            fut.result(timeout=15)
         logger.info("Agent 调度器已重载")
         return True
     except Exception as e:
@@ -1510,6 +1532,11 @@ async def lifespan(app):
         logger.warning(f"交易日历预热调度失败(降级为只判周末): {e}")
 
     global scheduler, price_alert_scheduler, paper_trading_scheduler, context_maintenance_scheduler
+    global _MAIN_LOOP
+    try:
+        _MAIN_LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        _MAIN_LOOP = None
     scheduler = build_scheduler()
     scheduler.start()
     logger.info("Agent 调度器已启动")
