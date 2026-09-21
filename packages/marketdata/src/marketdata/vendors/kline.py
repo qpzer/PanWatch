@@ -144,12 +144,8 @@ class StooqKlineVendor(KlineVendor):
 
 
 def _em_secid(sym: Symbol) -> str:
-    if sym.market == Market.HK:
-        return f"116.{sym.code}"
-    if sym.market == Market.US:
-        return f"105.{sym.code}"
-    from marketdata.symbol import _cn_exchange
-    return f"{'1' if _cn_exchange(sym.code) == 'sh' else '0'}.{sym.code}"
+    # 与 Symbol.to_eastmoney_secid 同一套映射（含 800xxx 统计指标的 47 号市场）
+    return sym.to_eastmoney_secid()
 
 
 def fetch_eastmoney_kline(secid: str, days: int) -> list[Bar]:

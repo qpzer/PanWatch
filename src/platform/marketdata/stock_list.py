@@ -443,6 +443,13 @@ def _realtime_search(query: str, market: str = "", limit: int = 20) -> list[dict
             # 场内基金（ETF/LOF 等）：有场内实时行情，按 CN 标的收录；
             # 场外基金无场内行情，由 _is_exchange_traded_fund 排除
             stock_market = "CN"
+        elif (
+            classify == "BStock"
+            and (item.get("MktNum") or "").strip() == "47"
+            and code_raw.startswith("800")
+        ):
+            # 东财市场统计指标 800xxx 族（全A指数、A股平均股价等），有行情和日K
+            stock_market = "CN"
         elif classify == "HKStock" or "港" in security_type:
             stock_market = "HK"
         elif classify == "UsStock" or "美" in security_type:
@@ -474,11 +481,16 @@ def _realtime_search(query: str, market: str = "", limit: int = 20) -> list[dict
     return results
 
 
+# 其他行情软件代码 → 东财代码（830000 是同花顺/通达信系的"A股平均股价"，东财体系内为 800005）
+_SEARCH_CODE_ALIASES = {"830000": "800005"}
+
+
 def search_stocks(query: str, market: str = "", limit: int = 20) -> list[dict]:
     """搜索股票 - 优先使用实时搜索，失败则使用缓存"""
     q = query.strip()
     if not q:
         return []
+    q = _SEARCH_CODE_ALIASES.get(q, q)
 
     # 尝试实时搜索
     results = _realtime_search(q, market, limit)
