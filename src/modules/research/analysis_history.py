@@ -4,7 +4,7 @@ import re
 from datetime import date, datetime, timedelta
 
 from src.modules.automation.agent_catalog import infer_agent_kind
-from src.platform.persistence.database import SessionLocal
+from src.platform.persistence.database import SessionLocal, run_with_lock_retry
 from src.platform.persistence.models import AnalysisHistory
 from src.platform.persistence.json_safe import to_jsonable
 
@@ -44,6 +44,28 @@ def save_analysis(
 
     date_str = analysis_date.strftime("%Y-%m-%d")
 
+    try:
+        run_with_lock_retry(
+            lambda: _save_analysis_once(
+                agent_name, stock_symbol, content, title, raw_data, date_str
+            ),
+            label=f"保存分析记录({agent_name}/{stock_symbol}/{date_str})",
+        )
+        return True
+    except Exception as e:
+        logger.error(f"保存分析记录失败: {e}")
+        return False
+
+
+def _save_analysis_once(
+    agent_name: str,
+    stock_symbol: str,
+    content: str,
+    title: str,
+    raw_data: dict | None,
+    date_str: str,
+) -> None:
+    """save_analysis 的单次执行体，异常向上抛由调用方决定是否重试。"""
     db = SessionLocal()
     try:
         payload = to_jsonable(raw_data or {})
@@ -78,12 +100,9 @@ def save_analysis(
             logger.info(f"新增分析记录: {agent_name}/{stock_symbol}/{date_str}")
 
         db.commit()
-        return True
-
-    except Exception as e:
-        logger.error(f"保存分析记录失败: {e}")
+    except Exception:
         db.rollback()
-        return False
+        raise
     finally:
         db.close()
 

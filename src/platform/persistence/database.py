@@ -19,11 +19,13 @@ logger = logging.getLogger(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "panwatch.db")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-# SQLite 适合本地开发和单实例部署，但并发写入时不能无限等待锁。
-# 将等待限制在数秒内，让上层事务可以回滚/重试或返回明确错误，而不是
-# 让浏览器请求长时间表现为“卡死”。
-SQLITE_BUSY_TIMEOUT_MS = 5_000
+# SQLite 适合本地开发和单实例部署。写库冲突(如定时任务与模拟盘扫描并发)时,
+# 等待方需要足够长的 busy_timeout 才能熬过扫描类任务持有的秒级~分钟级写锁;
+# 配合 run_with_lock_retry 的退避重试,避免偶发锁冲突直接丢数据。
+SQLITE_BUSY_TIMEOUT_MS = 30_000
 SQLITE_INIT_RETRY_DELAYS = (0.5, 1.0, 2.0)
+# 业务写库遇到 "database is locked" 时的退避重试间隔(秒)
+SQLITE_WRITE_RETRY_DELAYS = (1.0, 2.0, 4.0)
 
 engine = create_engine(
     f"sqlite:///{DB_PATH}",
@@ -104,6 +106,29 @@ def _is_sqlite_lock_error(exc: BaseException) -> bool:
             return True
         current = current.__cause__ or current.__context__
     return False
+
+
+def run_with_lock_retry(fn, *, label: str = "数据库写入", delays=SQLITE_WRITE_RETRY_DELAYS):
+    """执行一个完整的写库单元；遇 SQLite 锁按退避间隔重试，其余异常直接抛出。
+
+    fn 必须是一个可重复执行、自带 commit/rollback 的闭包(幂等),因为锁冲突
+    可能发生在事务中途,重试会从头再跑一遍。
+    """
+    for attempt in range(len(delays) + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt >= len(delays) or not _is_sqlite_lock_error(exc):
+                raise
+            delay = delays[attempt]
+            logger.warning(
+                "%s 遇到数据库锁，%.1fs 后重试 (%s/%s)",
+                label,
+                delay,
+                attempt + 1,
+                len(delays),
+            )
+            time.sleep(delay)
 
 
 def _has_column(conn, table: str, column: str) -> bool:
