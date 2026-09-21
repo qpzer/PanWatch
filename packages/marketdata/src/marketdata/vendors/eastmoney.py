@@ -17,8 +17,10 @@ from marketdata.vendors.base import QuoteVendor
 
 logger = logging.getLogger(__name__)
 
-_URL = "https://push2.eastmoney.com/api/qt/stock/get"
-_HOST = "push2.eastmoney.com"
+# 本地构建：push2 官方域名在本机网络不可达（连接被重置），push2delay 提供相同
+# 合约且可达（与 discovery.py 的注释一致），故统一切换。
+_URL = "https://push2delay.eastmoney.com/api/qt/stock/get"
+_HOST = "push2delay.eastmoney.com"
 _MIN_INTERVAL_S = 0.2
 # f43 最新价 / f44 最高 / f45 最低 / f46 今开 / f47 成交量 / f48 成交额 / f50 量比 /
 # f55(备用,CN 主用 f168) / f57 代码 / f58 名称 / f59 小数位数 / f60 昨收 /
