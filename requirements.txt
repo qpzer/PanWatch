@@ -30,7 +30,9 @@ xhtml2pdf>=0.2.17
 # 时间的 SEC EDGAR 基本面与独立决策回测。适配层依赖的
 # route_to_vendor/load_ohlcv/get_graph_args/create_initial_state 仍保持签名稳定；
 # REVIEW 不是可交易的 Hold，必须由 result_mapper 显式展示为“待人工复核”。
-tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@v0.5.0
+# 本地构建：GitHub 直连不稳定且 PyPI 包要求 >=3.12(镜像是 3.11)，
+# 改为 vendor/ 目录安装 tag 源码，在 Dockerfile 中显式安装。
+# tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@v0.5.0
 
 # 本仓内独立行情数据包(editable 本地安装;发 PyPI 前不占外部依赖)
 -e ./packages/marketdata
