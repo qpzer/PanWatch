@@ -604,7 +604,7 @@ export default function StocksPage() {
     try {
       const params = new URLSearchParams({
         include_expired: 'true',
-        stock_keys: items.map(item => `${item.symbol}:${item.market}`).join(','),
+        stock_keys: items.map(item => `${item.market}:${item.symbol}`).join(','),
       })
       return await fetchAPI<Record<string, PoolSuggestion>>(`/suggestions?${params.toString()}`, { signal })
     } catch (e) {
