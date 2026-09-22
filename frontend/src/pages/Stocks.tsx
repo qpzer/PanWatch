@@ -592,6 +592,7 @@ export default function StocksPage() {
         method: 'POST',
         body: JSON.stringify({ items }),
         signal,
+        timeoutMs: 30_000,
       })
     } catch (e) {
       console.warn('刷新行情失败:', e)
@@ -778,25 +779,29 @@ export default function StocksPage() {
         loadSuggestions: requestSuggestions,
         loadPriceAlerts: requestPriceAlerts,
         loadKlines: requestKlineSummaries,
-      }, signal)
+      }, signal, base => {
+        // 第一段（本地 DB 数据）落地即渲染，行情/建议/K线由第二阶段后台补齐
+        if (signal.aborted) return
+        setStocks(base.stocks)
+        setPortfolioRaw(base.portfolio)
+        setMarketStatus(base.marketStatus)
+        const nextAccounts = base.portfolio.accounts.map(account => ({
+          id: account.id,
+          name: account.name,
+          available_funds: account.available_funds,
+          enabled: true,
+        }))
+        setAccounts(nextAccounts)
+        setExpandedAccounts(new Set(nextAccounts.map(account => account.id)))
+        setLoading(false)
+      })
 
+      if (signal.aborted) return
       const quoteMap = toQuoteMap(data.quotes)
-      setStocks(data.stocks)
-      setPortfolioRaw(data.portfolio)
-      setMarketStatus(data.marketStatus)
       setQuotes(quoteMap)
       setKlineSummaries(data.klines)
       setPoolSuggestions(data.suggestions)
       setPriceAlertSummaryMap(toPriceAlertSummaryMap(data.priceAlerts))
-      setPortfolio(mergePortfolioQuotes(data.portfolio, quoteMap))
-      const nextAccounts = data.portfolio.accounts.map(account => ({
-        id: account.id,
-        name: account.name,
-        available_funds: account.available_funds,
-        enabled: true,
-      }))
-      setAccounts(nextAccounts)
-      setExpandedAccounts(new Set(nextAccounts.map(account => account.id)))
       if (data.quotes.length > 0) setLastRefreshTime(new Date())
     })().catch(error => {
       if (!signal.aborted) console.error('加载持仓页面数据失败:', error)
@@ -890,12 +895,14 @@ export default function StocksPage() {
 
   useEffect(() => {
     const controller = new AbortController()
+    // Agent 中文显示名等配置后台并发加载，不进首屏门控
+    void loadConfigAsync(controller.signal)
     void loadInitialData(controller.signal)
     return () => {
       controller.abort()
       initialLoadPromiseRef.current = null
     }
-  }, [loadInitialData])
+  }, [loadInitialData, loadConfigAsync])
 
   useEffect(() => {
     if (agentDialogStock) void loadConfigAsync()

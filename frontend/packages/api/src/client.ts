@@ -46,13 +46,21 @@ export async function fetchAPI<T>(path: string, options?: ApiRequestOptions): Pr
     headers['Content-Type'] = 'application/json'
   }
 
-  const timeoutController = options?.signal ? null : new AbortController()
+  // 外部 signal 与超时共存：任一端触发都会中止请求，避免传入 signal 后超时兜底失效
+  const timeoutController = new AbortController()
   const timeoutMs = typeof options?.timeoutMs === 'number' && options.timeoutMs > 0
     ? options.timeoutMs
     : DEFAULT_TIMEOUT_MS
-  const timeoutId = timeoutController
-    ? window.setTimeout(() => timeoutController.abort(), timeoutMs)
-    : null
+  const timeoutId = window.setTimeout(() => timeoutController.abort(), timeoutMs)
+  const externalSignal = options?.signal
+  const relayExternalAbort = () => timeoutController.abort()
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      timeoutController.abort()
+    } else {
+      externalSignal.addEventListener('abort', relayExternalAbort, { once: true })
+    }
+  }
 
   let res: Response
   try {
@@ -63,17 +71,18 @@ export async function fetchAPI<T>(path: string, options?: ApiRequestOptions): Pr
         ...headers,
         ...(requestOptions.headers as Record<string, string> | undefined),
       },
-      signal: requestOptions.signal || timeoutController?.signal,
+      signal: timeoutController.signal,
     })
   } catch (error: any) {
     if (error?.name === 'AbortError') {
+      // 外部主动取消（如页面卸载）原样抛出，仅超时中止改写为超时提示
+      if (externalSignal?.aborted) throw error
       throw new Error('请求超时，请稍后重试')
     }
     throw error
   } finally {
-    if (timeoutId !== null) {
-      window.clearTimeout(timeoutId)
-    }
+    window.clearTimeout(timeoutId)
+    externalSignal?.removeEventListener('abort', relayExternalAbort)
   }
 
   if (res.status === 401) {
