@@ -1,7 +1,8 @@
 """北向资金(同花顺 hexin)vendor + client 方法测试。
 
-离线 monkeypatch marketdata.vendors.northbound.market_get,不实抓(沙箱代理拦截 hexin)。
-真实响应结构未经实抓校验,构造样例按背景描述(当日分钟序列,hgt/sgt 累计值)搭建。
+离线 monkeypatch marketdata.vendors.northbound.market_get,不实抓。
+真实结构已实抓校准(2026-09-23):扁平 {"time":[...],"hgt":[...],"sgt":[...]},
+并行数组、元素可为数字/数字字符串/null;包装结构({"data": ...})仅作防御保留。
 """
 from __future__ import annotations
 
@@ -19,7 +20,16 @@ def _hexin_payload(hgt: list, sgt: list, *, date: str | None = None) -> dict:
     return {"data": inner}
 
 
+def _flat_payload(times: list, hgt: list, sgt: list) -> dict:
+    """真实形态:扁平并行数组,无 data 包裹。"""
+    return {"time": times, "hgt": hgt, "sgt": sgt}
+
+
 class TestUnwrapPayload:
+    def test_flat_real_structure(self):
+        flat = {"time": ["09:30"], "hgt": [1.0], "sgt": [0.5]}
+        assert nb._unwrap_payload(flat) is flat
+
     def test_single_layer(self):
         assert nb._unwrap_payload({"data": {"hgt": [], "sgt": []}}) == {"hgt": [], "sgt": []}
 
@@ -49,6 +59,41 @@ class TestLastPoint:
         assert nb._last_point("not a series") == (None, None)
 
 
+class TestPickPoint:
+    """扁平并行数组 + now 对齐(实抓结构);成对元素走 _last_point 老路径。"""
+
+    def test_flat_without_now_takes_last_valid(self):
+        t, v = nb._pick_point(["09:30", "09:31", "10:15"], [1.2, 3.4, 8.76], None)
+        assert t == "10:15" and v == 8.76
+
+    def test_flat_with_now_aligns_to_time_axis(self):
+        # 数组预填到 15:00 的残留值,now=09:31 时应取 09:31 的点而非末值
+        times = ["09:30", "09:31", "10:15", "15:00"]
+        series = [1.2, 3.4, 8.76, -99.0]
+        t, v = nb._pick_point(times, series, "09:31")
+        assert (t, v) == ("09:31", 3.4)
+
+    def test_flat_now_before_all_points_falls_back_to_last(self):
+        t, v = nb._pick_point(["09:30", "09:31"], [1.2, 3.4], "08:00")
+        assert (t, v) == ("09:31", 3.4)
+
+    def test_flat_skips_none_and_empty_string_holes(self):
+        t, v = nb._pick_point(["09:30", "09:31", "09:32"], [1.2, None, ""], None)
+        assert (t, v) == ("09:30", 1.2)
+
+    def test_flat_string_numbers_pass_through(self):
+        t, v = nb._pick_point(["09:30"], ["0.03"], None)
+        assert v == "0.03"  # 数值转换在 _to_float 做,取点原样返回
+
+    def test_flat_all_empty_returns_none_none(self):
+        assert nb._pick_point(["09:30"], [None], None) == (None, None)
+        assert nb._pick_point(None, [1.2], None) == (None, 1.2)  # 无 time 轴也能取值
+
+    def test_pair_series_delegates_to_last_point(self):
+        t, v = nb._pick_point(None, [["09:30", 1.1], ["09:31", 1.5]], "23:59")
+        assert (t, v) == ("09:31", 1.5)
+
+
 class TestToFloatAndSgtValid:
     def test_to_float_handles_nan_and_none(self):
         assert nb._to_float(None) is None
@@ -62,8 +107,14 @@ class TestToFloatAndSgtValid:
     def test_sgt_valid_rejects_extreme_magnitude(self):
         assert nb._sgt_valid(999999.0) is None
 
+    def test_sgt_valid_rejects_real_world_dirty_value(self):
+        # 实抓脏值:sgt 持续报 365~400 亿(2026-09-23)
+        assert nb._sgt_valid(388.97) is None
+        assert nb._sgt_valid(-365.5) is None
+
     def test_sgt_valid_accepts_normal_range(self):
         assert nb._sgt_valid(12.34) == 12.34
+        assert nb._sgt_valid(-45.6) == -45.6
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +138,65 @@ class TestHexinNorthboundVendor:
         assert item.sgt_net == 2.34
         assert item.total_net == 8.76 + 2.34
         assert item.time == "10:15"
+
+    def test_flat_real_structure_without_now_takes_tail(self, monkeypatch):
+        payload = _flat_payload(
+            times=["09:30", "09:31", "10:15"],
+            hgt=[1.2, 3.4, 8.76],
+            sgt=[0.5, 1.1, 2.34],
+        )
+        monkeypatch.setattr(nb, "market_get", lambda *a, **k: payload)
+
+        out = nb.HexinNorthboundVendor().fetch([], {})
+        assert len(out) == 1
+        item = out[0]
+        assert item.hgt_net == 8.76
+        assert item.sgt_net == 2.34
+        assert item.time == "10:15"
+
+    def test_flat_with_now_picks_current_time_point(self, monkeypatch):
+        # 盘中数组预填了到 15:00 的残留值,now 对齐后不应取到未来时点
+        payload = _flat_payload(
+            times=["09:30", "09:31", "10:15", "15:00"],
+            hgt=[1.2, 3.4, 8.76, -88.0],
+            sgt=[0.5, 1.1, 2.34, -66.0],
+        )
+        monkeypatch.setattr(nb, "market_get", lambda *a, **k: payload)
+
+        out = nb.HexinNorthboundVendor().fetch([], {"now": "09:35"})
+        item = out[0]
+        assert item.hgt_net == 3.4
+        assert item.sgt_net == 1.1
+        assert item.time == "09:31"
+
+    def test_flat_string_values_and_null_holes(self, monkeypatch):
+        payload = _flat_payload(
+            times=["09:30", "09:31", "09:32"],
+            hgt=["0", "0.03", None],
+            sgt=[None, None, None],
+        )
+        monkeypatch.setattr(nb, "market_get", lambda *a, **k: payload)
+
+        out = nb.HexinNorthboundVendor().fetch([], {"now": "09:32"})
+        item = out[0]
+        assert item.hgt_net == 0.03
+        assert item.sgt_net is None
+        assert item.total_net is None
+
+    def test_flat_sgt_dirty_magnitude_discarded(self, monkeypatch):
+        # 实抓 sgt 脏值 365~400 亿:弃 sgt,保 hgt,不臆造合计
+        payload = _flat_payload(
+            times=["10:15"],
+            hgt=[8.76],
+            sgt=[388.97],
+        )
+        monkeypatch.setattr(nb, "market_get", lambda *a, **k: payload)
+
+        out = nb.HexinNorthboundVendor().fetch([], {})
+        item = out[0]
+        assert item.hgt_net == 8.76
+        assert item.sgt_net is None
+        assert item.total_net is None
 
     def test_sgt_nan_falls_back_to_none_and_total_none(self, monkeypatch):
         payload = _hexin_payload(
