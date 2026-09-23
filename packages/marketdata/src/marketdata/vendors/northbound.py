@@ -4,13 +4,15 @@
 不可用。改走同花顺 hexin 私有接口 `data.hexin.cn/market/hsgtApi/method/dayChart/`,
 返回当日分钟级累计净买入序列,`hgt`(沪股通)/`sgt`(深股通),单位均为"亿元"。
 
-**待实抓校准**:沙箱代理会拦截 hexin,无法实抓验证真实响应结构。以下解析按背景描述
-("响应含当日分钟序列,每点有时间 + hgt/sgt 累计值")尽力构造 + 逐层防御 `.get()`,
-拿不到就返回 []。真实结构上线前需用真实响应复核。
+真实响应结构(2026-09-23 实抓校准):扁平 JSON,无 data 包裹——
+{"time": ["09:10", ..., "15:00"], "hgt": [0, 0.03, ...], "sgt": [...]}。
+time 是全天时间轴(262 点),hgt/sgt 是并行数组,元素为数字或数字字符串,可有 null。
+注意:数组会预填到 15:00 的残留/脏值(盘中尚未到的时点也有数),不能直接取末值,
+须按宿主传入的 config["now"]("HH:MM",北京时间)对齐时间轴取点。
 
-已知坑(SKILL 标注):`sgt`(深股通)近期数据不可靠,可能是 NaN 或量级异常(远超合理的
-"亿元"范围),必须容错——异常时 sgt_net=None,不参与 total_net 计算,也不让异常值污染
-hgt_net。绝不用无参 now()/time()/random 填充缺失的 date/time。
+已知坑(SKILL 标注 + 实抓确认):`sgt`(深股通)数据不可靠,实抓返回 365~400 亿的
+持续脏值(远超合理范围),必须容错——异常时 sgt_net=None,不参与 total_net 计算,
+也不让异常值污染 hgt_net。绝不用无参 now()/time()/random 填充缺失的 date/time。
 """
 from __future__ import annotations
 
@@ -34,9 +36,9 @@ _HEADERS = {
     "User-Agent": _UA,
 }
 
-# sgt(深股通)近期不可靠,可能出现量级异常(远超合理"亿元"净买入范围)的脏值;
-# 超过此绝对值阈值一律视为异常丢弃。阈值本身是防御性经验值,非精确业务规则。
-_SGT_MAX_ABS = 2000.0
+# sgt(深股通)不可靠:实抓(2026-09-23)返回 365~400 亿的持续脏值;历史披露时代
+# 深股通单日净买入极值约 ±130 亿,150 亿作为防御上限,超过一律视为异常丢弃。
+_SGT_MAX_ABS = 150.0
 
 
 def _to_float(value) -> float | None:
@@ -63,11 +65,14 @@ def _sgt_valid(value) -> float | None:
 
 
 def _unwrap_payload(resp) -> dict:
-    """防御性剥离外层包裹:hexin 响应可能是 {"data": {...}} 或再套一层
-    {"data": {"data": {...}}}——具体结构待实抓校准,逐层 .get() 兜底,拿不到就 {}。
+    """剥离外层包裹,拿到含 hgt/sgt 的一层。
+
+    真实响应是扁平结构(见模块 docstring),直接命中返回;data 单/双层包裹仅作防御。
     """
     if not isinstance(resp, dict):
         return {}
+    if isinstance(resp.get("hgt"), (list, tuple)) or isinstance(resp.get("sgt"), (list, tuple)):
+        return resp
     layer = resp.get("data")
     if not isinstance(layer, dict):
         return {}
@@ -78,8 +83,8 @@ def _unwrap_payload(resp) -> dict:
 
 
 def _last_point(series) -> tuple[object, object]:
-    """从分钟序列取末值(当日最新累计净买入)。序列元素可能是 [time, value] 或
-    {"time":.., "value":..}(键名待实抓校准,防御多种常见键名)。取不到返回 (None, None)。
+    """从分钟序列取末值。序列元素是 [time, value] 或 {"time":.., "value":..} 形态时使用;
+    扁平并行数组形态(time 轴独立)请走 _pick_point。取不到返回 (None, None)。
     """
     if not isinstance(series, (list, tuple)) or not series:
         return None, None
@@ -91,6 +96,34 @@ def _last_point(series) -> tuple[object, object]:
         v = last.get("value") or last.get("v") or last.get("y") or last.get("net")
         return t, v
     return None, None
+
+
+def _pick_point(times, series, now_hhmm: str | None) -> tuple[object, object]:
+    """从分钟序列取"当前时点"的值。
+
+    - 成对/字典元素:委托 _last_point 取末值(包装结构防御路径)。
+    - 扁平并行数组(实抓结构):times=["09:10",...] 与 series=[0.03,...] 按下标对齐,
+      取最后一个 time <= now_hhmm 的非空点——实抓发现数组会预填到 15:00 的残留值,
+      直接取末值会拿到未来时段的脏数据;now_hhmm 缺失或无匹配时退化为最后一个非空点。
+    """
+    if not isinstance(series, (list, tuple)) or not series:
+        return None, None
+    if isinstance(series[0], (list, tuple, dict)):
+        return _last_point(series)
+
+    pairs: list[tuple[object, object]] = []
+    for i, v in enumerate(series):
+        if v is None or v == "":
+            continue
+        t = times[i] if isinstance(times, (list, tuple)) and i < len(times) else None
+        pairs.append((t, v))
+    if not pairs:
+        return None, None
+    if now_hhmm:
+        timed = [(t, v) for t, v in pairs if isinstance(t, str) and t <= now_hhmm]
+        if timed:
+            return timed[-1]
+    return pairs[-1]
 
 
 class HexinNorthboundVendor(_NorthboundVendorBase):
@@ -116,8 +149,13 @@ class HexinNorthboundVendor(_NorthboundVendorBase):
         if not payload:
             return []
 
-        hgt_time, hgt_raw = _last_point(payload.get("hgt"))
-        sgt_time, sgt_raw = _last_point(payload.get("sgt"))
+        # 宿主传入当前北京时间("HH:MM")用于对齐 time 轴;包内不调无参 now()
+        now_raw = (config or {}).get("now")
+        now_hhmm = str(now_raw)[:5] if now_raw else None
+
+        times = payload.get("time")
+        hgt_time, hgt_raw = _pick_point(times, payload.get("hgt"), now_hhmm)
+        sgt_time, sgt_raw = _pick_point(times, payload.get("sgt"), now_hhmm)
         hgt_net = _to_float(hgt_raw)
         sgt_net = _sgt_valid(sgt_raw)
         if hgt_net is None and sgt_net is None:

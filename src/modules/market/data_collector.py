@@ -1007,7 +1007,7 @@ class DataCollectorManager:
                 error=f"provider {source.provider} 无对应 vendor，包内未实现该北向资金源",
             )
 
-        cfg = source.config or {}
+        cfg = {**(source.config or {}), "now": datetime.now().strftime("%H:%M")}
         md = MarketData(
             config=StaticConfigProvider(
                 {
