@@ -1,9 +1,11 @@
-"""东财 CN 报价 vendor(quote 第二源)。push2 stock/get,单只查询,逐只循环取批量。
+"""东财 CN 报价 vendor(quote 第二源)。push2 ulist.np 批量接口,一次请求取全部标的。
 
-字段映射经交叉核对 akshare `stock_ask_bid_em.py`(同一 push2 stock/get 端点,
-fltt=2 预格式化模式下的字段含义)+ 本仓 kline.py/capital_flow.py 东财现有惯例。
-本 vendor 不传 fltt/invt,取原始未格式化值,价格类字段需 /10^f59 还原,
-百分比类字段(涨跌幅/换手率/量比)固定 /100 还原。
+背景:push2/push2delay 的 stock/get 单只查询路径被东财 WAF 按路径封禁(云服务器 IP
+连接被秒断,2026-09-23 实抓确认),同域名 ulist.np/get 批量路径正常,故整体切换。
+批量请求顺带消除逐只循环的节流等待。
+
+字段映射对齐 akshare stock_zh_a_spot_em(同一 ulist.np 端点):fltt=2 预格式化模式下
+价格/涨跌/百分比字段直接是 float(停牌等无数据给 "-"),成交额/市值单位为元。
 """
 
 from __future__ import annotations
@@ -17,19 +19,19 @@ from marketdata.vendors.base import QuoteVendor
 
 logger = logging.getLogger(__name__)
 
-# 本地构建：push2 官方域名在本机网络不可达（连接被重置），push2delay 提供相同
-# 合约且可达（与 discovery.py 的注释一致），故统一切换。
-_URL = "https://push2delay.eastmoney.com/api/qt/stock/get"
-_HOST = "push2delay.eastmoney.com"
+_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+_HOST = "push2.eastmoney.com"
 _MIN_INTERVAL_S = 0.2
-# f43 最新价 / f44 最高 / f45 最低 / f46 今开 / f47 成交量 / f48 成交额 / f50 量比 /
-# f55(备用,CN 主用 f168) / f57 代码 / f58 名称 / f59 小数位数 / f60 昨收 /
-# f116 总市值 / f117 流通市值 / f168 换手率 / f169 涨跌额 / f170 涨跌幅 / f171 振幅(未映射)
-_FIELDS = "f43,f44,f45,f46,f47,f48,f50,f55,f57,f58,f59,f60,f116,f117,f168,f169,f170,f171"
+# f2 最新价 / f3 涨跌幅 / f4 涨跌额 / f5 成交量(手) / f6 成交额(元) /
+# f8 换手率 / f9 市盈率(动) / f10 量比 / f12 代码 / f13 市场号 / f14 名称 /
+# f15 最高 / f16 最低 / f17 今开 / f18 昨收 / f20 总市值(元) / f21 流通市值(元)
+_FIELDS = "f2,f3,f4,f5,f6,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21"
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://quote.eastmoney.com/",
 }
+# secids 逗号拼接进 URL,分批控制 URL 长度(实测 50 只远低于长度上限)
+_BATCH_SIZE = 50
 
 
 def _to_float(value) -> float | None:
@@ -41,59 +43,63 @@ def _to_float(value) -> float | None:
         return None
 
 
-def _scaled(value, decimals: int) -> float | None:
-    """价格类字段还原:raw / 10^decimals。"""
-    v = _to_float(value)
-    if v is None:
+def _parse_row(row: dict | None, market: str) -> Quote | None:
+    if not isinstance(row, dict):
         return None
-    try:
-        return v / (10 ** decimals)
-    except Exception:
-        return None
-
-
-def _pct(value) -> float | None:
-    """百分比类字段还原:raw / 100(涨跌幅/换手率/量比,与小数位数无关)。"""
-    v = _to_float(value)
-    if v is None:
-        return None
-    return v / 100
-
-
-def _parse_one(data: dict | None, market: str, fallback_code: str) -> Quote | None:
-    if not data or data.get("f43") is None:
-        return None
-    dec = int(_to_float(data.get("f59")) or 2)
-    price = _scaled(data.get("f43"), dec)
+    price = _to_float(row.get("f2"))
     if price is None or price <= 0:
         return None
 
-    turnover_rate = _pct(data.get("f168"))
-    if turnover_rate is None:
-        turnover_rate = _pct(data.get("f55"))
-
-    total_mv = _to_float(data.get("f116"))
-    circ_mv = _to_float(data.get("f117"))
+    total_mv = _to_float(row.get("f20"))
+    circ_mv = _to_float(row.get("f21"))
 
     return Quote(
-        symbol=str(data.get("f57") or fallback_code),
+        symbol=str(row.get("f12") or ""),
         market=market,
-        name=str(data.get("f58") or ""),
+        name=str(row.get("f14") or ""),
         current_price=price,
-        prev_close=_scaled(data.get("f60"), dec),
-        open_price=_scaled(data.get("f46"), dec),
-        high_price=_scaled(data.get("f44"), dec),
-        low_price=_scaled(data.get("f45"), dec),
-        change_amount=_scaled(data.get("f169"), dec),
-        change_pct=_pct(data.get("f170")),
-        volume=_to_float(data.get("f47")),
-        turnover=_to_float(data.get("f48")),
-        turnover_rate=turnover_rate,
-        volume_ratio=_pct(data.get("f50")),
-        pe_ratio=None,  # 未确认稳定字段(f162 猜测,未经真实响应验证),宁缺毋错
+        prev_close=_to_float(row.get("f18")),
+        open_price=_to_float(row.get("f17")),
+        high_price=_to_float(row.get("f15")),
+        low_price=_to_float(row.get("f16")),
+        change_amount=_to_float(row.get("f4")),
+        change_pct=_to_float(row.get("f3")),  # fltt=2 下已是百分数(0.14 = 0.14%)
+        volume=_to_float(row.get("f5")),
+        turnover=_to_float(row.get("f6")),
+        turnover_rate=_to_float(row.get("f8")),
+        volume_ratio=_to_float(row.get("f10")),
+        pe_ratio=_to_float(row.get("f9")),
         circulating_market_value=(circ_mv / 1e8) if circ_mv is not None else None,
         total_market_value=(total_mv / 1e8) if total_mv is not None else None,
     )
+
+
+def _fetch_batch(secids: list[str]) -> list[dict]:
+    payload = market_get(
+        _URL,
+        host_key=_HOST,
+        min_interval_s=_MIN_INTERVAL_S,
+        params={
+            "secids": ",".join(secids),
+            "fields": _FIELDS,
+            "fltt": "2",
+            "invt": "2",
+        },
+        headers=_HEADERS,
+        timeout=10,
+        retries=2,
+        parse="json",
+        log_label="东财报价",
+    )
+    if not payload or not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return []
+    diff = data.get("diff")
+    if isinstance(diff, dict):  # 单标的时防御:个别情况下 diff 不是 list
+        return [diff]
+    return diff if isinstance(diff, list) else []
 
 
 class EastmoneyQuoteVendor(QuoteVendor):
@@ -103,26 +109,16 @@ class EastmoneyQuoteVendor(QuoteVendor):
     def fetch(self, symbols: list[Symbol], config: dict) -> list[Quote]:
         if not symbols:
             return []
+        cn = [s for s in symbols if s.market == Market.CN]
+        if not cn:
+            return []
+        market = cn[0].market.value
+
         out: list[Quote] = []
-        for sym in symbols:
-            if sym.market != Market.CN:
-                continue
-            payload = market_get(
-                _URL,
-                host_key=_HOST,
-                min_interval_s=_MIN_INTERVAL_S,
-                params={"secid": sym.to_eastmoney_secid(), "fields": _FIELDS},
-                headers=_HEADERS,
-                timeout=8,
-                retries=2,
-                parse="json",
-                log_label="东财报价",
-                symbol=sym.code,
-            )
-            if not payload:
-                continue
-            data = payload.get("data") if isinstance(payload, dict) else None
-            q = _parse_one(data, sym.market.value, sym.code)
-            if q:
-                out.append(q)
+        secids = [s.to_eastmoney_secid() for s in cn]
+        for i in range(0, len(secids), _BATCH_SIZE):
+            for row in _fetch_batch(secids[i : i + _BATCH_SIZE]):
+                q = _parse_row(row, market)
+                if q:
+                    out.append(q)
         return out
