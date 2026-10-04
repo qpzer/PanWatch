@@ -37,8 +37,29 @@ describe('TraceTimeline', () => {
       />,
     )
 
-    await user.click(screen.getByRole('button', { name: /执行记录/ }))
+    await user.click(screen.getByRole('button', { name: /研究进度/ }))
+    await user.click(screen.getByRole('button', { name: /开发者详情/ }))
     expect(screen.getByText('模型用量：输入 120，输出 30')).toBeTruthy()
+  })
+
+  it('shows task duration and token totals in the trace summary', async () => {
+    const user = userEvent.setup()
+    render(
+      <TraceTimeline
+        events={[
+          { event: 'model_usage', data: { input_tokens: 120, output_tokens: 30, duration_ms: 800 } },
+          { event: 'tool_call_start', data: { name: 'get_portfolio' } },
+          { event: 'tool_result', data: { name: 'get_portfolio', ok: true, duration_ms: 420 } },
+          { event: 'done', data: { duration_ms: 1240 } },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText('已完成 · 1.2s')).toBeTruthy()
+    await user.click(screen.getByRole('button', { name: /研究进度/ }))
+    await user.click(screen.getByRole('button', { name: /开发者详情/ }))
+    expect(screen.getByText('模型用量：输入 120，输出 30 · 800ms')).toBeTruthy()
+    expect(screen.getAllByText('数据已就绪：持仓 · 420ms').length).toBeGreaterThan(0)
   })
 
   it('expands the factual steps from the compact summary', async () => {
@@ -61,9 +82,10 @@ describe('TraceTimeline', () => {
       />,
     )
 
-    await user.click(screen.getByRole('button', { name: /执行记录/ }))
+    await user.click(screen.getByRole('button', { name: /研究进度/ }))
+    await user.click(screen.getByRole('button', { name: /开发者详情/ }))
 
-    expect(screen.getByText('调用工具：get_portfolio')).toBeTruthy()
+    expect(screen.getAllByText('正在查询：持仓').length).toBeGreaterThan(0)
     expect(screen.getByText('{"market":"CN"}')).toBeTruthy()
     expect(screen.getByText('持仓查询完成')).toBeTruthy()
     expect(screen.getByText('工具研究完成：选出 1 个')).toBeTruthy()
@@ -96,10 +118,11 @@ describe('TraceTimeline', () => {
       />,
     )
 
-    await user.click(screen.getByRole('button', { name: /执行记录/ }))
+    await user.click(screen.getByRole('button', { name: /研究进度/ }))
+    await user.click(screen.getByRole('button', { name: /开发者详情/ }))
 
     expect(screen.getByText('工具目录已准备：1 个直达，0 个已加载')).toBeTruthy()
     expect(screen.getByText('工具搜索完成：加载 1 个')).toBeTruthy()
-    expect(screen.getByText('调用工具：get_fundamentals')).toBeTruthy()
+    expect(screen.getAllByText('正在查询：get_fundamentals').length).toBeGreaterThan(0)
   })
 })

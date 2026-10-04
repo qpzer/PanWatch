@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from src.platform.marketdata.outcome_prices import completed_outcome_bar
+
 import asyncio
 import logging
 from datetime import date, datetime, timedelta
 
 from sqlalchemy import and_, case, func, or_
 
+from src.modules.automation.agent_catalog import RETIRED_AGENT_NAMES
 from src.platform.runtime.config import Settings
 from src.platform.marketdata.collectors.discovery_collector import EastMoneyDiscoveryCollector
 from src.platform.marketdata.collectors.kline_collector import KlineCollector
@@ -17,7 +20,6 @@ from src.platform.marketdata.models import MarketCode
 from src.platform.persistence.database import SessionLocal
 from src.platform.persistence.models import (
     EntryCandidate,
-    EntryCandidateFeedback,
     EntryCandidateOutcome,
     MarketScanSnapshot,
     Position,
@@ -43,7 +45,6 @@ AGENT_LABELS: dict[str, str] = {
     "premarket_outlook": "盘前分析",
     "intraday_monitor": "盘中监测",
     "daily_report": "收盘复盘",
-    "news_digest": "新闻速递",
     "market_scan": "市场扫描",
 }
 
@@ -974,7 +975,7 @@ def _merge_market_scan_seed(
     return added
 
 
-def _load_market_scan_inputs(limit_per_market: int = 60) -> dict[str, dict]:
+def _load_market_scan_inputs(limit_per_market: int = 60, *, markets: list[str] | None = None) -> dict[str, dict]:
     collector = EastMoneyDiscoveryCollector(
         proxy=_resolve_market_scan_proxy(),
     )
@@ -982,7 +983,7 @@ def _load_market_scan_inputs(limit_per_market: int = 60) -> dict[str, dict]:
     safe_limit = max(20, int(limit_per_market))
     min_required = min(max(12, int(safe_limit * 0.55)), safe_limit)
 
-    for market in ("CN", "HK", "US"):
+    for market in (("CN", "HK", "US") if markets is None else markets):
         try:
             turnover = _run_async(
                 collector.fetch_hot_stocks(
@@ -1103,7 +1104,7 @@ def _load_market_scan_inputs(limit_per_market: int = 60) -> dict[str, dict]:
                 )
 
     # Final per-market cap and stable ordering.
-    for market in ("CN", "HK", "US"):
+    for market in (("CN", "HK", "US") if markets is None else markets):
         keys = [k for k in result.keys() if k.startswith(f"{market}:")]
         if len(keys) <= safe_limit:
             continue
@@ -1116,13 +1117,14 @@ def _load_market_scan_inputs(limit_per_market: int = 60) -> dict[str, dict]:
     return result
 
 
-def _persist_market_scan_snapshot(snapshot: str, market_scan_map: dict[str, dict]) -> None:
+def _persist_market_scan_snapshot(snapshot: str, market_scan_map: dict[str, dict], *, markets: list[str] | None = None) -> None:
     if not snapshot:
         return
     db = SessionLocal()
     try:
         db.query(MarketScanSnapshot).filter(
-            MarketScanSnapshot.snapshot_date == snapshot
+            MarketScanSnapshot.snapshot_date == snapshot,
+            MarketScanSnapshot.stock_market.in_(markets) if markets is not None else True,
         ).delete(synchronize_session=False)
         rows = sorted(
             market_scan_map.values(),
@@ -1220,6 +1222,7 @@ def _load_latest_suggestions(limit: int = 300) -> list[StockSuggestion]:
                 StockSuggestion.stock_market,
                 func.max(StockSuggestion.id).label("max_id"),
             )
+            .filter(StockSuggestion.agent_name.notin_(RETIRED_AGENT_NAMES))
             .group_by(StockSuggestion.stock_symbol, StockSuggestion.stock_market)
             .subquery()
         )
@@ -1254,11 +1257,17 @@ def refresh_entry_candidates(
     snapshot_date: str | None = None,
     market_scan_limit: int = 60,
     max_kline_symbols: int = 72,
+    markets: list[str] | None = None,
 ) -> dict:
     snapshot = (snapshot_date or date.today().strftime("%Y-%m-%d")).strip()
+    if markets == []:
+        return {"snapshot_date": snapshot, "count": 0, "items": []}
     suggestions = _load_latest_suggestions(limit=max_inputs)
-    market_scan_map = _load_market_scan_inputs(limit_per_market=max(20, int(market_scan_limit)))
-    _persist_market_scan_snapshot(snapshot, market_scan_map)
+    if markets is not None:
+        suggestions = [s for s in suggestions if s.stock_market in markets]
+    scan_kwargs = {"markets": markets} if markets is not None else {}
+    market_scan_map = _load_market_scan_inputs(limit_per_market=max(20, int(market_scan_limit)), **scan_kwargs)
+    _persist_market_scan_snapshot(snapshot, market_scan_map, **scan_kwargs)
     holding_keys = _load_holding_keys()
 
     input_map: dict[str, dict] = dict(market_scan_map)
@@ -1376,7 +1385,8 @@ def refresh_entry_candidates(
     items: list[dict] = []
     try:
         db.query(EntryCandidate).filter(
-            EntryCandidate.snapshot_date == snapshot
+            EntryCandidate.snapshot_date == snapshot,
+            EntryCandidate.stock_market.in_(markets) if markets is not None else True,
         ).delete(synchronize_session=False)
 
         for key, inp in input_map.items():
@@ -1624,42 +1634,6 @@ def list_entry_candidates(
     return {"snapshot_date": snapshot, "count": len(items), "items": items}
 
 
-def save_entry_candidate_feedback(
-    *,
-    snapshot_date: str,
-    stock_symbol: str,
-    stock_market: str,
-    useful: bool,
-    candidate_source: str = "watchlist",
-    strategy_tags: list[str] | None = None,
-    reason: str = "",
-) -> bool:
-    symbol = (stock_symbol or "").strip().upper()
-    market = (stock_market or "CN").strip().upper() or "CN"
-    if not symbol:
-        return False
-    snap = (snapshot_date or "").strip() or date.today().strftime("%Y-%m-%d")
-
-    db = SessionLocal()
-    try:
-        row = EntryCandidateFeedback(
-            snapshot_date=snap,
-            stock_symbol=symbol,
-            stock_market=market,
-            candidate_source=(candidate_source or "watchlist").strip(),
-            strategy_tags=to_jsonable(strategy_tags or []),
-            useful=bool(useful),
-            reason=(reason or "").strip()[:200],
-        )
-        db.add(row)
-        db.commit()
-        return True
-    except Exception as e:
-        db.rollback()
-        logger.warning(f"保存候选反馈失败: {e}")
-        return False
-    finally:
-        db.close()
 
 
 def evaluate_entry_candidate_outcomes(
@@ -1732,11 +1706,12 @@ def evaluate_entry_candidate_outcomes(
                     stats["skipped_not_due"] += 1
                     continue
 
-                stats["eligible"] += 1
-                outcome_price = _pick_close_on_or_before(klines, target_day)
-                if outcome_price is None:
-                    stats["skipped_no_price"] += 1
+                bar = completed_outcome_bar(klines, snap_day, horizon, c.stock_market)
+                if bar is None:
+                    stats["skipped_not_due"] += 1
                     continue
+                target_day, outcome_price = bar
+                stats["eligible"] += 1
 
                 base_price = None
                 if c.entry_low is not None and c.entry_high is not None:
@@ -1792,6 +1767,7 @@ def evaluate_entry_candidate_outcomes(
                     outcome_status=status,
                     meta=to_jsonable(
                         {
+                            "horizon_unit": "trading_days",
                             "candidate_score": float(c.score or 0),
                             "action": c.action or "",
                             "action_label": c.action_label or "",
@@ -1824,53 +1800,6 @@ def get_entry_candidate_stats(*, days: int = 30) -> dict:
     since = utc_now() - timedelta(days=days)
     db = SessionLocal()
     try:
-        total, useful = (
-            db.query(
-                func.count(EntryCandidateFeedback.id),
-                func.sum(case((EntryCandidateFeedback.useful.is_(True), 1), else_=0)),
-            )
-            .filter(EntryCandidateFeedback.created_at >= since)
-            .first()
-        )
-        total = int(total or 0)
-        useful = int(useful or 0)
-        useless = max(0, total - useful)
-        useful_rate = round((useful / total * 100.0), 2) if total > 0 else 0.0
-
-        by_source_rows = (
-            db.query(
-                EntryCandidateFeedback.candidate_source,
-                func.count(EntryCandidateFeedback.id).label("total"),
-                func.sum(case((EntryCandidateFeedback.useful.is_(True), 1), else_=0)).label("useful"),
-            )
-            .filter(EntryCandidateFeedback.created_at >= since)
-            .group_by(EntryCandidateFeedback.candidate_source)
-            .all()
-        )
-        by_market_rows = (
-            db.query(
-                EntryCandidateFeedback.stock_market,
-                func.count(EntryCandidateFeedback.id).label("total"),
-                func.sum(case((EntryCandidateFeedback.useful.is_(True), 1), else_=0)).label("useful"),
-            )
-            .filter(EntryCandidateFeedback.created_at >= since)
-            .group_by(EntryCandidateFeedback.stock_market)
-            .all()
-        )
-
-        by_strategy_map: dict[str, dict] = {}
-        strat_rows = (
-            db.query(EntryCandidateFeedback.strategy_tags, EntryCandidateFeedback.useful)
-            .filter(EntryCandidateFeedback.created_at >= since)
-            .all()
-        )
-        for tags, is_useful in strat_rows:
-            for t in (tags or []):
-                item = by_strategy_map.setdefault(t, {"strategy": t, "strategy_label": STRATEGY_LABELS.get(t, t), "total": 0, "useful": 0})
-                item["total"] += 1
-                if is_useful:
-                    item["useful"] += 1
-
         latest_snapshot_row = (
             db.query(EntryCandidate.snapshot_date)
             .order_by(EntryCandidate.snapshot_date.desc())
@@ -1984,47 +1913,6 @@ def get_entry_candidate_stats(*, days: int = 30) -> dict:
                 else 0.0,
             }
 
-        by_source = []
-        for source_name, cnt, u in by_source_rows:
-            cnt = int(cnt or 0)
-            u = int(u or 0)
-            by_source.append(
-                {
-                    "source": source_name or "watchlist",
-                    "source_label": _candidate_source_label(source_name or "watchlist"),
-                    "total": cnt,
-                    "useful": u,
-                    "useful_rate": round((u / cnt * 100.0), 2) if cnt > 0 else 0.0,
-                }
-            )
-        by_market = []
-        for m, cnt, u in by_market_rows:
-            cnt = int(cnt or 0)
-            u = int(u or 0)
-            by_market.append(
-                {
-                    "market": (m or "CN").strip().upper(),
-                    "total": cnt,
-                    "useful": u,
-                    "useful_rate": round((u / cnt * 100.0), 2) if cnt > 0 else 0.0,
-                }
-            )
-
-        by_strategy = sorted(
-            [
-                {
-                    **v,
-                    "useless": max(0, v["total"] - v["useful"]),
-                    "useful_rate": round((v["useful"] / v["total"] * 100.0), 2)
-                    if v["total"] > 0
-                    else 0.0,
-                }
-                for v in by_strategy_map.values()
-            ],
-            key=lambda x: (x["total"], x["useful"]),
-            reverse=True,
-        )
-
         outcome_rows = (
             db.query(
                 EntryCandidateOutcome.horizon_days,
@@ -2059,15 +1947,6 @@ def get_entry_candidate_stats(*, days: int = 30) -> dict:
 
         return {
             "window_days": days,
-            "feedback": {
-                "total": total,
-                "useful": useful,
-                "useless": useless,
-                "useful_rate": useful_rate,
-            },
-            "by_source": by_source,
-            "by_market": by_market,
-            "by_strategy": by_strategy[:20],
             "coverage": coverage,
             "outcomes": outcome_summary,
         }

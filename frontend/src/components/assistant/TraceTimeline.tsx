@@ -1,45 +1,79 @@
 import { AlertCircle, CheckCircle2, ChevronDown, FileClock, Gauge, ListTree, PauseCircle, Search, Wrench } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { AssistantTraceEvent } from '@panwatch/api'
+import { useTranslation } from 'react-i18next'
 
 interface TraceTimelineProps {
   events: AssistantTraceEvent[]
   live?: boolean
+  reviewRequest?: number
 }
 
-function describeExtensionEvent(event: AssistantTraceEvent): { label: string; icon: typeof FileClock } | null {
+function describeExtensionEvent(event: AssistantTraceEvent, tr: (key: string, options?: Record<string, unknown>) => string): { label: string; icon: typeof FileClock } | null {
   if (event.data.extension !== 'tool_research') return null
   const data = event.data.data || {}
   switch (event.data.event) {
-    case 'started': return { label: '研究可用工具', icon: Search }
+    case 'started': return { label: tr('extension.started'), icon: Search }
     case 'exposure': return {
-      label: `工具目录已准备：${data.direct_tools?.length || 0} 个直达，${data.loaded_tools?.length || 0} 个已加载`,
+      label: tr('extension.exposure', { direct: data.direct_tools?.length || 0, loaded: data.loaded_tools?.length || 0 }),
       icon: Search,
     }
-    case 'candidates_scored': return { label: `筛选工具候选：${data.candidates?.length || 0} 个`, icon: Search }
-    case 'completed': return { label: `工具研究完成：选出 ${data.selected_tools?.length || 0} 个`, icon: Search }
-    case 'searched': return { label: `工具搜索完成：加载 ${data.selected_tools?.length || 0} 个`, icon: Search }
-    case 'fallback': return { label: '工具研究回退，继续使用默认工具集', icon: AlertCircle }
-    default: return { label: `扩展事件：${event.data.event || 'unknown'}`, icon: FileClock }
+    case 'candidates_scored': return { label: tr('extension.candidates', { count: data.candidates?.length || 0 }), icon: Search }
+    case 'completed': return { label: tr('extension.completed', { count: data.selected_tools?.length || 0 }), icon: Search }
+    case 'searched': return { label: tr('extension.searched', { count: data.selected_tools?.length || 0 }), icon: Search }
+    case 'fallback': return { label: tr('extension.fallback'), icon: AlertCircle }
+    default: return { label: tr('extension.unknown', { event: event.data.event || 'unknown' }), icon: FileClock }
   }
 }
 
-function describe(event: AssistantTraceEvent): { label: string; icon: typeof FileClock } {
+function describe(event: AssistantTraceEvent, tr: (key: string, options?: Record<string, unknown>) => string): { label: string; icon: typeof FileClock } {
   const name = typeof event.data.name === 'string' ? event.data.name : ''
-  const extension = event.event === 'extension_event' ? describeExtensionEvent(event) : null
+  const displayName = name ? tr(`tools.${name}`, { defaultValue: name }) : name
+  const extension = event.event === 'extension_event' ? describeExtensionEvent(event, tr) : null
   if (extension) return extension
   switch (event.event) {
-    case 'context_prepared': return { label: event.data.compressed ? '上下文已压缩并准备' : '上下文已准备', icon: FileClock }
-    case 'step_updated': return { label: `执行步骤 ${event.data.step || ''}`, icon: ListTree }
-    case 'tool_call_start': return { label: `调用工具：${name}`, icon: Wrench }
-    case 'tool_result': return { label: event.data.ok ? `工具完成：${name}` : `工具失败：${name}`, icon: event.data.ok ? CheckCircle2 : AlertCircle }
-    case 'model_usage': return { label: `模型用量：输入 ${event.data.input_tokens || 0}，输出 ${event.data.output_tokens || 0}`, icon: Gauge }
-    case 'approval_required': return { label: '等待用户审批', icon: PauseCircle }
-    case 'paused': return { label: '任务已暂停', icon: PauseCircle }
-    case 'done': return { label: '任务完成', icon: CheckCircle2 }
-    case 'error': return { label: '任务失败', icon: AlertCircle }
-    default: return { label: '任务已启动', icon: FileClock }
+    case 'task_created':
+    case 'task_queued': return { label: tr('events.queued'), icon: FileClock }
+    case 'retry_scheduled': return { label: tr('events.retrying'), icon: FileClock }
+    case 'cancelled': return { label: tr('events.cancelled'), icon: PauseCircle }
+    case 'context_prepared': return { label: tr(event.data.compressed ? 'events.contextCompressed' : 'events.contextPrepared'), icon: FileClock }
+    case 'step_updated': return { label: tr('events.step', { step: event.data.step || '' }), icon: ListTree }
+    case 'tool_call_start': return { label: tr('events.toolStart', { name: displayName }), icon: Wrench }
+    case 'tool_result': return {
+      label: `${tr(event.data.ok ? 'events.toolDone' : 'events.toolFailed', { name: displayName })}${formatDurationSuffix(event.data.duration_ms)}`,
+      icon: event.data.ok ? CheckCircle2 : AlertCircle,
+    }
+    case 'model_usage': {
+      const suffix = formatDurationSuffix(event.data.duration_ms)
+      const cache = Number(event.data.cached_input_tokens || 0)
+      const reasoning = Number(event.data.reasoning_output_tokens || 0)
+      const extras = [
+        cache > 0 ? tr('events.cache', { count: cache }) : '',
+        reasoning > 0 ? tr('events.reasoning', { count: reasoning }) : '',
+      ].filter(Boolean)
+      const usageSuffix = extras.length > 0 ? ` · ${extras.join(' · ')}` : ''
+      return {
+        label: `${tr('events.modelUsage', { input: event.data.input_tokens || 0, output: event.data.output_tokens || 0, extra: usageSuffix })}${suffix}`,
+        icon: Gauge,
+      }
+    }
+    case 'approval_required': return { label: tr('events.approval'), icon: PauseCircle }
+    case 'paused': return { label: tr('events.paused'), icon: PauseCircle }
+    case 'done': return { label: tr('events.done'), icon: CheckCircle2 }
+    case 'error': return { label: tr('events.error'), icon: AlertCircle }
+    default: return { label: tr('events.started'), icon: FileClock }
   }
+}
+
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return ''
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  return `${(ms / 1000).toFixed(1).replace(/\.0$/, '')}s`
+}
+
+function formatDurationSuffix(value: unknown): string {
+  const duration = formatDuration(Number(value || 0))
+  return duration ? ` · ${duration}` : ''
 }
 
 function detail(event: AssistantTraceEvent): string {
@@ -52,21 +86,50 @@ function detail(event: AssistantTraceEvent): string {
   return ''
 }
 
-function summary(events: AssistantTraceEvent[]): string {
-  const toolCalls = events.filter((event) => event.event === 'tool_call_start').length
-  const latest = [...events].reverse().find((event) => ['done', 'error', 'paused'].includes(event.event))
-  const status = latest?.event === 'done'
-    ? '已完成'
-    : latest?.event === 'error'
-    ? '已失败'
-    : latest?.event === 'paused'
-    ? '等待继续'
-    : '执行中'
-  return toolCalls > 0 ? `${status} · ${toolCalls} 次工具调用` : status
+function summary(events: AssistantTraceEvent[], tr: (key: string, options?: Record<string, unknown>) => string): string {
+  const terminal = [...events].reverse().find((event) => ['done', 'error', 'paused', 'cancelled'].includes(event.event))
+  const duration = Number(terminal?.data.duration_ms || 0)
+  const status = terminal?.event === 'done'
+    ? tr('status.done')
+    : terminal?.event === 'cancelled'
+    ? tr('status.cancelled')
+    : terminal?.event === 'error'
+    ? tr('status.error')
+    : terminal?.event === 'paused'
+    ? tr('status.paused')
+    : tr('status.running')
+  const details = [formatDuration(duration)].filter(Boolean)
+  return details.length > 0 ? `${status} · ${details.join(' · ')}` : status
 }
 
-export function TraceTimeline({ events, live = false }: TraceTimelineProps) {
+function developerSummary(events: AssistantTraceEvent[], tr: (key: string, options?: Record<string, unknown>) => string): string {
+  const toolCalls = events.filter((event) => event.event === 'tool_call_start').length
+  const totalTokens = events
+    .filter((event) => event.event === 'model_usage')
+    .reduce((total, event) => total + Number(
+      event.data.total_tokens
+      || Number(event.data.input_tokens || 0) + Number(event.data.output_tokens || 0),
+    ), 0)
+  return [
+    toolCalls > 0 ? tr('toolCalls', { count: toolCalls }) : '',
+    totalTokens > 0 ? `${totalTokens} tokens` : '',
+  ].filter(Boolean).join(' · ')
+}
+
+function userVisible(event: AssistantTraceEvent): boolean {
+  return !['model_usage', 'extension_event'].includes(event.event)
+}
+
+export function TraceTimeline({ events, live = false, reviewRequest = 0 }: TraceTimelineProps) {
+  const { t } = useTranslation('configuration')
+  const traceT = t as unknown as (key: string, options?: Record<string, unknown>) => string
+  const tr = (key: string, options?: Record<string, unknown>) => traceT(`p4.components.trace.${key}`, options)
   const [expanded, setExpanded] = useState(live)
+  const [developerExpanded, setDeveloperExpanded] = useState(false)
+  useEffect(() => {
+    if (reviewRequest > 0) { setExpanded(true); setDeveloperExpanded(true) }
+  }, [reviewRequest])
+  const userEvents = events.filter(userVisible)
   if (events.length === 0) return null
   return (
     <section data-testid="assistant-trace" className="rounded-lg border border-border/50 bg-background/70 px-3 py-2 text-[11px]">
@@ -77,25 +140,53 @@ export function TraceTimeline({ events, live = false }: TraceTimelineProps) {
         onClick={() => setExpanded((value) => !value)}
       >
         <FileClock className="h-3.5 w-3.5 shrink-0" />
-        <span>执行记录</span>
-        <span className="min-w-0 flex-1 truncate text-[10px] font-normal">{summary(events)}</span>
+        <span>{tr('events.title')}</span>
+        <span className="min-w-0 flex-1 truncate text-[10px] font-normal">{summary(events, tr)}</span>
         <ChevronDown className={`h-3.5 w-3.5 shrink-0 transition-transform ${expanded ? 'rotate-180' : ''}`} />
       </button>
       {expanded && (
         <ol className="mt-2 space-y-1.5 border-t border-border/40 pt-2">
-          {events.map((event, index) => {
-            const { label, icon: Icon } = describe(event)
-            const eventDetail = detail(event)
+          {userEvents.map((event, index) => {
+            const { label, icon: Icon } = describe(event, tr)
             return (
               <li key={`${event.id ?? index}-${event.event}-${index}`} className="flex items-start gap-2 text-foreground">
                 <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                 <div className="min-w-0">
                   <div>{label}</div>
-                  {eventDetail && <div className="break-words text-muted-foreground">{eventDetail}</div>}
                 </div>
               </li>
             )
           })}
+          <li className="border-t border-border/40 pt-1.5">
+            <button
+              type="button"
+              className="flex w-full items-center gap-1.5 text-left text-[10px] text-muted-foreground hover:text-foreground"
+              aria-expanded={developerExpanded}
+              onClick={() => setDeveloperExpanded((value) => !value)}
+            >
+              <Wrench className="h-3 w-3" />
+              <span>{tr('developer.title')}</span>
+              <span className="flex-1 truncate">{developerSummary(events, tr)}</span>
+              <ChevronDown className={`h-3 w-3 transition-transform ${developerExpanded ? 'rotate-180' : ''}`} />
+            </button>
+            {developerExpanded && (
+              <ol className="mt-1.5 space-y-1.5 rounded-md bg-muted/30 p-2">
+                {events.map((event, index) => {
+                  const { label, icon: Icon } = describe(event, tr)
+                  const eventDetail = detail(event)
+                  return (
+                    <li key={`developer-${event.id ?? index}-${event.event}`} className="flex items-start gap-2">
+                      <Icon className="h-3 w-3 shrink-0 text-muted-foreground" />
+                      <div className="min-w-0">
+                        <div>{label}</div>
+                        {eventDetail && <div className="break-words font-mono text-[9px] text-muted-foreground">{eventDetail}</div>}
+                      </div>
+                    </li>
+                  )
+                })}
+              </ol>
+            )}
+          </li>
         </ol>
       )}
     </section>

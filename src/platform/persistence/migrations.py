@@ -1965,6 +1965,202 @@ def _m126_assistant_task_events(conn: Connection) -> None:
     )
 
 
+def _m127_assistant_trace_metrics(conn: Connection) -> None:
+    """Store lightweight assistant timing and provider usage summaries."""
+    for name, statement in (
+        ("model", "ALTER TABLE assistant_task_runs ADD COLUMN model TEXT"),
+        (
+            "usage_source",
+            "ALTER TABLE assistant_task_runs ADD COLUMN usage_source TEXT NOT NULL DEFAULT 'unknown'",
+        ),
+        (
+            "input_tokens",
+            "ALTER TABLE assistant_task_runs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "output_tokens",
+            "ALTER TABLE assistant_task_runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "total_tokens",
+            "ALTER TABLE assistant_task_runs ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "cached_input_tokens",
+            "ALTER TABLE assistant_task_runs ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "reasoning_output_tokens",
+            "ALTER TABLE assistant_task_runs ADD COLUMN reasoning_output_tokens INTEGER NOT NULL DEFAULT 0",
+        ),
+    ):
+        _add_column_if_missing(conn, "assistant_task_runs", name, statement)
+    for name, statement in (
+        (
+            "duration_ms",
+            "ALTER TABLE assistant_tool_invocations ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "attempt_count",
+            "ALTER TABLE assistant_tool_invocations ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 1",
+        ),
+        (
+            "error_code",
+            "ALTER TABLE assistant_tool_invocations ADD COLUMN error_code TEXT",
+        ),
+    ):
+        _add_column_if_missing(conn, "assistant_tool_invocations", name, statement)
+
+
+def _m128_assistant_trusted_results(conn: Connection) -> None:
+    """Persist versioned assistant results and evidence observation times."""
+    for name, statement in (
+        (
+            "result_schema_version",
+            "ALTER TABLE assistant_task_runs ADD COLUMN result_schema_version INTEGER NOT NULL DEFAULT 1",
+        ),
+        (
+            "result_data",
+            "ALTER TABLE assistant_task_runs ADD COLUMN result_data JSON",
+        ),
+    ):
+        _add_column_if_missing(conn, "assistant_task_runs", name, statement)
+    _add_column_if_missing(
+        conn,
+        "assistant_tool_invocations",
+        "observed_at",
+        "ALTER TABLE assistant_tool_invocations ADD COLUMN observed_at DATETIME",
+    )
+    _add_column_if_missing(
+        conn,
+        "assistant_tool_invocations",
+        "result_data",
+        "ALTER TABLE assistant_tool_invocations ADD COLUMN result_data JSON",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_assistant_task_run_final_message",
+        "CREATE INDEX ix_assistant_task_run_final_message ON assistant_task_runs(final_message_id)",
+    )
+
+
+def _m129_assistant_task_notifications(conn: Connection) -> None:
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS assistant_task_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_run_id INTEGER NOT NULL,
+            event_sequence INTEGER NOT NULL,
+            kind VARCHAR NOT NULL,
+            read_at DATETIME,
+            resolved_at DATETIME,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT ux_assistant_notification_event UNIQUE (task_run_id, event_sequence)
+        )
+    """))
+    _create_index_if_missing(conn, "ix_assistant_notification_inbox", "CREATE INDEX ix_assistant_notification_inbox ON assistant_task_notifications(resolved_at, read_at, id)")
+    _create_index_if_missing(conn, "ix_assistant_notification_task", "CREATE INDEX ix_assistant_notification_task ON assistant_task_notifications(task_run_id)")
+
+
+def _m130_global_notifications(conn: Connection) -> None:
+    from datetime import datetime
+    from sqlalchemy.dialects.sqlite import insert
+    from src.platform.persistence.models import NotificationEvent, NotificationReceipt
+
+    NotificationEvent.__table__.create(conn, checkfirst=True)
+    NotificationReceipt.__table__.create(conn, checkfirst=True)
+    if not all(_has_table(conn, name) for name in ('assistant_task_notifications', 'assistant_task_runs', 'chat_conversations')):
+        return
+    expiry = "(SELECT MIN(a.expires_at) FROM assistant_tool_approvals a WHERE a.task_run_id=n.task_run_id AND a.status='pending')" if _has_table(conn, 'assistant_tool_approvals') else 'NULL'
+    rows = conn.execute(text(f"""
+        SELECT n.*, t.conversation_id, c.title, {expiry} AS approval_expires_at
+        FROM assistant_task_notifications n
+        JOIN assistant_task_runs t ON t.id = n.task_run_id
+        JOIN chat_conversations c ON c.id = t.conversation_id
+        ORDER BY n.id
+    """)).mappings()
+    for row in rows:
+        def stamp(value):
+            return datetime.fromisoformat(value) if isinstance(value, str) else value
+        values = dict(id=row['id'], source='assistant', event_type=f"assistant_{row['kind']}",
+                      severity='warning' if row['kind'] == 'failed' else 'info',
+                      attention='action_required' if row['kind'] == 'awaiting_approval' else 'informational',
+                      dedupe_key=f"assistant:{row['task_run_id']}:{row['event_sequence']}",
+                      group_key=f"assistant:{row['task_run_id']}", subject_kind='assistant_task',
+                      subject_id=str(row['task_run_id']), correlation_id=str(row['task_run_id']),
+                      template_key=f"assistant_{row['kind']}", template_params={},
+                      display_snapshot={'title': (row['title'] or '')[:200]},
+                      actions=[dict(kind='assistant_conversation', conversation_id=row['conversation_id'], task_id=row['task_run_id'])],
+                      toast_eligible=False, occurred_at=stamp(row['created_at']), resolved_at=stamp(row['resolved_at']),
+                      expires_at=stamp(row['approval_expires_at']) if row['kind'] == 'awaiting_approval' else None)
+        conn.execute(insert(NotificationEvent).values(**values).on_conflict_do_nothing(index_elements=['dedupe_key']))
+        notification_id = conn.execute(text('SELECT id FROM notification_events WHERE dedupe_key=:key'), {'key': values['dedupe_key']}).scalar_one()
+        conn.execute(insert(NotificationReceipt).values(notification_id=notification_id, recipient_key='installation:default',
+                     read_at=stamp(row['read_at']), created_at=stamp(row['created_at']))
+                     .on_conflict_do_nothing(index_elements=['notification_id', 'recipient_key']))
+
+
+def _m131_assistant_conversation_titles(conn: Connection) -> None:
+    _add_column_if_missing(conn, 'chat_conversations', 'title_source',
+        "ALTER TABLE chat_conversations ADD COLUMN title_source TEXT NOT NULL DEFAULT 'legacy'")
+
+
+def _m132_assistant_context_exports(conn: Connection) -> None:
+    from src.platform.persistence.models import AssistantContextExport
+
+    AssistantContextExport.__table__.create(conn, checkfirst=True)
+
+
+def _m133_archive_idle_intraday_notifications(conn: Connection) -> None:
+    from src.platform.scheduling.run_summary import is_idle_single_summary
+
+    if not all(_has_table(conn, table) for table in (
+        "agent_runs", "notification_events", "notification_receipts",
+    )):
+        return
+    candidates = conn.execute(text("""
+SELECT e.id, r.result
+FROM notification_events e
+JOIN agent_runs r ON e.subject_id = CAST(r.id AS TEXT)
+WHERE e.source = 'agent' AND e.subject_kind = 'agent_run'
+  AND e.event_type = 'agent_completed' AND e.attention = 'informational'
+  AND r.agent_name = 'intraday_monitor' AND r.status = 'success'
+  AND r.trigger_source = 'schedule'
+  AND COALESCE(r.error, '') = ''
+  AND COALESCE(r.notify_attempted, 0) = 0 AND COALESCE(r.notify_sent, 0) = 0
+  AND r.result LIKE 'single mode executed 0, skipped %, total %'
+""")).mappings().all()
+    ids = [{"id": row["id"]} for row in candidates if is_idle_single_summary(row["result"])]
+    if ids:
+        # Retain both the source run and notification history. Archive only
+        # proven idle notices, preserving any existing receipt timestamps.
+        conn.execute(text("""
+UPDATE notification_receipts
+SET archived_at = COALESCE(archived_at, CURRENT_TIMESTAMP),
+    read_at = COALESCE(read_at, CURRENT_TIMESTAMP)
+WHERE notification_id = :id
+"""), ids)
+        logger.info("Archived %s idle intraday notification events", len(ids))
+
+
+def _m134_remove_manual_feedback(conn: Connection) -> None:
+    # SQLite removes the tables' indexes with DROP TABLE. Automated prediction
+    # and candidate outcomes remain the source of evaluation data.
+    conn.execute(text("DROP TABLE IF EXISTS suggestion_feedback"))
+    conn.execute(text("DROP TABLE IF EXISTS entry_candidate_feedback"))
+
+
+def _m135_retire_unused_agents(conn: Connection) -> None:
+    # Remove executable configuration and bindings, preserving reports and
+    # run history so existing notification/report links remain readable.
+    for table, column in (
+        ("stock_agents", "agent_name"),
+        ("notify_throttle", "agent_name"),
+        ("agent_configs", "name"),
+    ):
+        if _has_table(conn, table):
+            conn.execute(text(f"DELETE FROM {table} WHERE {column} IN ('chart_analyst', 'news_digest')"))
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(101, "agent_config_kind_and_visibility", _m101_agent_config_kind),
     Migration(102, "backfill_agent_kind_data", _m102_backfill_agent_kind),
@@ -1992,6 +2188,15 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(124, "assistant_context_snapshots", _m124_assistant_context_snapshots),
     Migration(125, "assistant_task_protocol", _m125_assistant_task_protocol),
     Migration(126, "assistant_task_events", _m126_assistant_task_events),
+    Migration(127, "assistant_trace_metrics", _m127_assistant_trace_metrics),
+    Migration(128, "assistant_trusted_results", _m128_assistant_trusted_results),
+    Migration(129, "assistant_task_notifications", _m129_assistant_task_notifications),
+    Migration(130, "global_notifications", _m130_global_notifications),
+    Migration(131, "assistant_conversation_titles", _m131_assistant_conversation_titles),
+    Migration(132, 'assistant_context_exports', _m132_assistant_context_exports),
+    Migration(133, "archive_idle_intraday_notifications", _m133_archive_idle_intraday_notifications),
+    Migration(134, "remove_manual_feedback", _m134_remove_manual_feedback),
+    Migration(135, "retire_unused_agents", _m135_retire_unused_agents),
 )
 
 

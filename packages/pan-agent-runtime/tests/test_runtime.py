@@ -60,6 +60,14 @@ class DenyPolicy:
         return ToolPermissionDecision.deny("not allowed")
 
 
+class AllowPolicy:
+    def is_tool_visible(self, _request, _tool):
+        return True
+
+    async def decide(self, _request, _tool, _call):
+        return ToolPermissionDecision.allow()
+
+
 class CapturingModel:
     def __init__(self):
         self.received_tools = []
@@ -224,6 +232,55 @@ def test_runtime_forwards_optional_model_usage_as_a_fact_event():
     assert usage_events[0].data["input_tokens"] == 120
 
 
+def test_runtime_records_model_turn_duration_even_without_provider_usage():
+    class SlowModel:
+        async def run_turn(self, _messages, _tools, _emit_token, tool_choice=None):
+            await asyncio.sleep(0.001)
+            return ModelTurn(content="完成")
+
+    sink = CollectingSink()
+    result = asyncio.run(AgentRuntime(SlowModel(), registry(lambda *_: None)).run(request(), sink))
+
+    assert result.status is RunStatus.COMPLETED
+    usage_events = [event for event in sink.events if event.type is EventType.MODEL_USAGE]
+    assert len(usage_events) == 1
+    assert usage_events[0].data["duration_ms"] >= 0
+    assert usage_events[0].data["usage_available"] is False
+
+
+def test_runtime_records_failed_model_turn_duration():
+    class FailingModel:
+        async def run_turn(self, _messages, _tools, _emit_token, tool_choice=None):
+            await asyncio.sleep(0.001)
+            raise RuntimeError("provider unavailable")
+
+    sink = CollectingSink()
+    result = asyncio.run(AgentRuntime(FailingModel(), registry(lambda *_: None)).run(request(), sink))
+
+    assert result.status is RunStatus.FAILED
+    usage_events = [event for event in sink.events if event.type is EventType.MODEL_USAGE]
+    assert len(usage_events) == 1
+    assert usage_events[0].data["duration_ms"] >= 0
+    assert usage_events[0].data["error_code"] == "model_failed"
+
+
+def test_runtime_preserves_public_model_error_code():
+    class PublicProviderError(RuntimeError):
+        error_code = "ai_quota_exhausted"
+
+    class FailingModel:
+        async def run_turn(self, _messages, _tools, _emit_token, tool_choice=None):
+            raise PublicProviderError("raw provider details must not become the result")
+
+    sink = CollectingSink()
+    result = asyncio.run(AgentRuntime(FailingModel(), registry(lambda *_: None)).run(request(), sink))
+
+    assert result.status is RunStatus.FAILED
+    assert result.error_code == "ai_quota_exhausted"
+    usage_events = [event for event in sink.events if event.type is EventType.MODEL_USAGE]
+    assert usage_events[0].data["error_code"] == "ai_quota_exhausted"
+
+
 def test_tool_failure_is_retried_once_and_answer_is_completed():
     attempts = 0
 
@@ -253,6 +310,37 @@ def test_tool_failure_is_retried_once_and_answer_is_completed():
     assert result.status is RunStatus.COMPLETED
     assert result.answer == "完成"
     assert EventType.TOOL_COMPLETED in [event.type for event in sink.events]
+
+
+def test_runtime_records_tool_duration_and_attempt_count():
+    attempts = 0
+
+    async def flaky_tool(_request, _arguments):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary")
+        return ToolResult.success(
+            summary="ok",
+            data={},
+            sources=[],
+            observed_at=__import__("datetime").datetime.now(__import__("datetime").UTC),
+        )
+
+    model = FixedModel(
+        [
+            ModelTurn(tool_calls=[ToolCall(id="call-1", name="lookup")]),
+            ModelTurn(content="完成"),
+        ]
+    )
+    sink = CollectingSink()
+
+    result = asyncio.run(AgentRuntime(model, registry(flaky_tool)).run(request(), sink))
+
+    assert result.status is RunStatus.COMPLETED
+    completed = [event for event in sink.events if event.type is EventType.TOOL_COMPLETED]
+    assert completed[-1].data["duration_ms"] >= 0
+    assert completed[-1].data["attempt_count"] == 2
 
 
 def test_tool_result_keeps_the_preceding_call_for_the_next_model_turn():
@@ -341,7 +429,11 @@ def test_required_tool_choice_repairs_a_text_only_turn_without_leaking_text():
     registry = write_registry(write_note)
     sink = CollectingSink()
 
-    result = asyncio.run(AgentRuntime(model, registry).run(request_with_required_tool, sink))
+    result = asyncio.run(
+        AgentRuntime(model, registry, policy=AllowPolicy()).run(
+            request_with_required_tool, sink
+        )
+    )
 
     assert result.status is RunStatus.COMPLETED
     assert result.answer == "提醒已成功更新。"
@@ -368,7 +460,9 @@ def test_required_tool_choice_returns_stable_error_after_one_repair_attempt():
     )
 
     result = asyncio.run(
-        AgentRuntime(TextOnlyModel(), write_registry(lambda *_: None)).run(
+        AgentRuntime(
+            TextOnlyModel(), write_registry(lambda *_: None), policy=AllowPolicy()
+        ).run(
             request_with_required_tool, CollectingSink()
         )
     )
@@ -762,6 +856,7 @@ def test_optional_extension_emits_facts_without_changing_model_tools():
         EventType.EXTENSION_EVENT,
         EventType.EXTENSION_EVENT,
         EventType.STEP_UPDATED,
+        EventType.MODEL_USAGE,
         EventType.ANSWER_TOKEN,
         EventType.RUN_COMPLETED,
     ]

@@ -9,10 +9,13 @@
     "pnpm": "9.15.9"
   },
   "scripts": {
+    "check:i18n": "node scripts/check-i18n-literals.mjs && node scripts/check-ui-primitives.mjs",
+    "check:market-colors": "node scripts/check-market-colors.mjs",
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "node scripts/check-ui-primitives.mjs && tsc -b && vite build",
     "test": "vitest",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "check:ui": "node scripts/check-ui-primitives.mjs"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.0.5",
@@ -28,10 +31,12 @@
     "clsx": "^2.1.0",
     "date-fn": "^0.0.2",
     "html-to-image": "^1.11.13",
+    "i18next": "^26.4.2",
     "lucide-react": "^0.300.0",
     "react": "^18.3.0",
     "react-day-picker": "^9.13.2",
     "react-dom": "^18.3.0",
+    "react-i18next": "^17.0.15",
     "react-markdown": "^10.1.0",
     "react-router-dom": "^6.20.0",
     "remark-gfm": "^4.0.1",

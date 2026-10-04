@@ -15,8 +15,10 @@ from src.platform.marketdata.collectors.kline_collector import KlineCollector, k
 from src.platform.notifications.notifier import NotifierManager
 from src.platform.marketdata.marketdata_client import md_quote_rows
 from src.platform.marketdata.models import MarketCode, MARKETS
+from src.platform.marketdata.quote_display import quote_date_is_current
 from src.platform.persistence.database import SessionLocal
 from src.platform.persistence.models import NotifyChannel, PriceAlertHit, PriceAlertRule, Stock
+from src.platform.language import resolve_report_language
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +50,8 @@ def _is_trading_time(market: MarketCode) -> bool:
     return market_def.is_trading_time()
 
 
-def _day_key(now: datetime) -> str:
-    return now.astimezone(timezone.utc).strftime("%Y-%m-%d")
+def _day_key(now: datetime, market: str) -> str:
+    return now.astimezone(MARKETS[_to_market(market)].get_tz()).strftime("%Y-%m-%d")
 
 
 def _minute_bucket(now: datetime) -> str:
@@ -234,17 +236,21 @@ class PriceAlertEngine:
             if now > exp:
                 return False, "expired"
 
+        # Automatic alerts always require a confirmed trading day. "always"
+        # means all hours on that day; dry-run tests may inspect historical quotes.
+        if not bypass_market_hours:
+            from src.platform.scheduling.trading_calendar import is_trading_day
+            if not is_trading_day(rule.stock.market):
+                return False, "non_trading_day"
         if rule.market_hours_mode == "trading_only" and not bypass_market_hours:
             if not _is_trading_time(_to_market(rule.stock.market)):
                 return False, "non_trading"
 
-        today = _day_key(now)
-        if (rule.trigger_date or "") != today:
-            rule.trigger_date = today
-            rule.trigger_count_today = 0
+        today = _day_key(now, rule.stock.market)
+        count_today = int(rule.trigger_count_today or 0) if (rule.trigger_date or "") == today else 0
 
         max_per_day = int(rule.max_triggers_per_day or 0)
-        if max_per_day > 0 and int(rule.trigger_count_today or 0) >= max_per_day:
+        if max_per_day > 0 and count_today >= max_per_day:
             return False, "daily_limit"
 
         if rule.repeat_mode == "once" and rule.last_trigger_at:
@@ -286,20 +292,38 @@ class PriceAlertEngine:
         quote = snapshot.get("quote") or {}
         price = _safe_float(quote.get("current_price"))
         chg = _safe_float(quote.get("change_pct"))
-        title = f"【价格提醒】{name} ({symbol})"
-        lines = [
-            f"规则: {rule.name or f'提醒#{rule.id}'}",
-            f"现价: {price:.2f}" if price is not None else "现价: --",
-            f"涨跌幅: {chg:+.2f}%" if chg is not None else "涨跌幅: --",
-        ]
+        english = resolve_report_language(db) == "en-US"
+        title = (
+            f"[Price alert] {name} ({symbol})"
+            if english
+            else f"【价格提醒】{name} ({symbol})"
+        )
+        rule_name = rule.name or (f"Alert #{rule.id}" if english else f"提醒#{rule.id}")
+        lines = (
+            [
+                f"Rule: {rule_name}",
+                f"Current price: {price:.2f}" if price is not None else "Current price: --",
+                f"Change: {chg:+.2f}%" if chg is not None else "Change: --",
+            ]
+            if english
+            else [
+                f"规则: {rule_name}",
+                f"现价: {price:.2f}" if price is not None else "现价: --",
+                f"涨跌幅: {chg:+.2f}%" if chg is not None else "涨跌幅: --",
+            ]
+        )
         hit_lines = []
         for h in snapshot.get("conditions") or []:
             if h.get("matched"):
                 hit_lines.append(
-                    f"- {h.get('type')} {h.get('op')} {h.get('target')} (当前: {h.get('actual')})"
+                    (
+                        f"- {h.get('type')} {h.get('op')} {h.get('target')} (current: {h.get('actual')})"
+                        if english
+                        else f"- {h.get('type')} {h.get('op')} {h.get('target')} (当前: {h.get('actual')})"
+                    )
                 )
         if hit_lines:
-            lines.append("命中条件:")
+            lines.append("Matched conditions:" if english else "命中条件:")
             lines.extend(hit_lines[:4])
         content = "\n".join(lines)
 
@@ -312,6 +336,47 @@ class PriceAlertEngine:
         except Exception as e:
             return False, str(e)
 
+    def _persist_hit(self, rule_id, now, snapshot, price):
+        from sqlalchemy.exc import IntegrityError
+        from src.modules.notifications.sources import price_hit
+        with SessionLocal() as db:
+            rule = db.get(PriceAlertRule, rule_id)
+            if rule is None or not rule.enabled:
+                return None
+            can, _reason = self._can_trigger(rule, now)
+            if not can:
+                return None
+            hit = PriceAlertHit(
+                rule_id=rule.id, stock_id=rule.stock.id, trigger_time=now,
+                trigger_bucket=_minute_bucket(now), trigger_snapshot=snapshot,
+            )
+            db.add(hit)
+            try:
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                return None
+            rule.last_trigger_at = now
+            rule.last_trigger_price = _safe_float(price)
+            today = _day_key(now, rule.stock.market)
+            count_today = int(rule.trigger_count_today or 0) if rule.trigger_date == today else 0
+            rule.trigger_count_today = count_today + 1
+            rule.trigger_date = today
+            if rule.repeat_mode == "once":
+                rule.enabled = False
+            price_hit(db, hit, rule)
+            hit_id = hit.id
+            db.commit()
+            return hit_id
+
+    def _persist_delivery(self, hit_id, notify_ok, notify_err):
+        with SessionLocal() as db:
+            hit = db.get(PriceAlertHit, hit_id)
+            if hit is not None:
+                hit.notify_success = bool(notify_ok)
+                hit.notify_error = notify_err or ""
+                db.commit()
+
     async def scan_once(
         self,
         *,
@@ -319,6 +384,7 @@ class PriceAlertEngine:
         dry_run: bool = False,
         bypass_market_hours: bool = False,
     ) -> dict:
+        bypass_market_hours = bool(bypass_market_hours and dry_run)
         now = _utc_now()
         db = SessionLocal()
         try:
@@ -329,7 +395,10 @@ class PriceAlertEngine:
             if not rules:
                 return {"total_rules": 0, "triggered": 0, "skipped": 0, "items": []}
 
-            stocks = [r.stock for r in rules if r.stock is not None]
+            # Apply the gate before any quote/K-line request.
+            gates = {r.id: self._can_trigger(r, now, bypass_market_hours=bypass_market_hours)
+                     for r in rules if r.stock is not None}
+            stocks = [r.stock for r in rules if r.stock is not None and gates[r.id][0]]
             quote_map = await self._fetch_quotes_map(stocks)
 
             items: list[dict] = []
@@ -342,11 +411,21 @@ class PriceAlertEngine:
                     skipped += 1
                     items.append({"rule_id": rule.id, "status": "no_stock"})
                     continue
+                can, reason = gates[rule.id]
+                if not can:
+                    skipped += 1
+                    items.append({"rule_id": rule.id, "status": "gated", "reason": reason})
+                    continue
                 market = _to_market(stock.market)
                 quote = quote_map.get((market.value, stock.symbol))
                 if not quote:
                     skipped += 1
                     items.append({"rule_id": rule.id, "status": "no_quote"})
+                    continue
+
+                if not dry_run and not quote_date_is_current(stock.market, quote):
+                    skipped += 1
+                    items.append({"rule_id": rule.id, "status": "stale_quote"})
                     continue
 
                 can, reason = self._can_trigger(
@@ -374,35 +453,17 @@ class PriceAlertEngine:
                     )
                     continue
 
-                bucket = _minute_bucket(now)
-                hit = PriceAlertHit(
-                    rule_id=rule.id,
-                    stock_id=stock.id,
-                    trigger_time=now,
-                    trigger_bucket=bucket,
-                    trigger_snapshot=ev.snapshot,
+                hit_id = await asyncio.to_thread(
+                    self._persist_hit, rule.id, now, ev.snapshot, quote.get("current_price"),
                 )
-                db.add(hit)
-                try:
-                    db.flush()
-                except Exception:
-                    db.rollback()
+                if hit_id is None:
                     skipped += 1
                     items.append({"rule_id": rule.id, "status": "duplicated"})
                     continue
-
+                # External delivery starts after the worker commits the hit and
+                # inbox event; the read session is never shared with that worker.
                 notify_ok, notify_err = await self._send_notify(db, rule, ev.snapshot)
-                hit.notify_success = bool(notify_ok)
-                hit.notify_error = notify_err or ""
-
-                rule.last_trigger_at = now
-                rule.last_trigger_price = _safe_float(quote.get("current_price"))
-                rule.trigger_count_today = int(rule.trigger_count_today or 0) + 1
-                rule.trigger_date = _day_key(now)
-                if rule.repeat_mode == "once":
-                    rule.enabled = False
-
-                db.commit()
+                await asyncio.to_thread(self._persist_delivery, hit_id, notify_ok, notify_err)
                 triggered += 1
                 items.append(
                     {

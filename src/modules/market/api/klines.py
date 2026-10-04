@@ -1,11 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from datetime import datetime
 
 from pydantic import BaseModel, Field
 
 from src.platform.marketdata.collectors.kline_collector import KlineCollector
 from src.platform.marketdata.models import MarketCode
+from src.web.errors import api_error
 
 router = APIRouter()
 
@@ -34,7 +35,7 @@ def _parse_market(market: str) -> MarketCode:
     try:
         return MarketCode(market)
     except ValueError:
-        raise HTTPException(400, f"不支持的市场: {market}")
+        raise api_error(400, "market_unsupported", f"不支持的市场: {market}")
 
 
 def _serialize_klines(klines) -> list[dict]:
@@ -122,25 +123,19 @@ def get_klines_batch(payload: KlineBatchRequest):
     if not payload.items:
         return []
 
-    results = []
-    for item in payload.items:
-        market_code = _parse_market(item.market)
-        collector = KlineCollector(market_code)
-        days = item.days or 60
-        interval = item.interval or "1d"
-        klines = collector.get_klines(item.symbol, days=days)
-        klines = _aggregate_klines(klines, interval)
-        results.append(
-            {
-                "symbol": item.symbol,
-                "market": market_code.value,
-                "days": days,
-                "interval": interval,
-                "klines": _serialize_klines(klines),
-            }
-        )
-
-    return results
+    keys = [(item.symbol, _parse_market(item.market), item.days or 60, item.interval or "1d")
+            for item in payload.items]
+    def load_one(key):
+        symbol, market, days, interval = key
+        klines = KlineCollector(market).get_klines(symbol, days=days)
+        return {
+            "symbol": symbol, "market": market.value, "days": days, "interval": interval,
+            "klines": _serialize_klines(_aggregate_klines(klines, interval)),
+        }
+    unique = list(dict.fromkeys(keys))
+    with ThreadPoolExecutor(max_workers=min(5, len(unique))) as pool:
+        rows = dict(zip(unique, pool.map(load_one, unique)))
+    return [rows[key] for key in keys]
 
 
 @router.get("/{symbol}/summary")
@@ -164,20 +159,20 @@ def get_kline_summary_batch(payload: KlineSummaryBatchRequest):
 
     market_codes = [_parse_market(item.market) for item in payload.items]
 
-    def load_one(index: int):
-        item = payload.items[index]
-        market_code = market_codes[index]
+    def load_one(symbol: str, market_code: MarketCode):
         try:
-            summary = KlineCollector(market_code).get_kline_summary(item.symbol)
+            summary = KlineCollector(market_code).get_kline_summary(symbol)
         except Exception as exc:
             summary = {"error": str(exc)}
         return {
-            "symbol": item.symbol,
+            "symbol": symbol,
             "market": market_code.value,
             "summary": summary,
         }
 
     # 与前端原先的并发上限保持一致，减少批量接口对数据源的瞬时压力。
-    with ThreadPoolExecutor(max_workers=min(5, len(payload.items))) as executor:
-        futures = [executor.submit(load_one, index) for index in range(len(payload.items))]
-        return [future.result() for future in futures]
+    keys = [(item.symbol, market) for item, market in zip(payload.items, market_codes)]
+    unique_keys = list(dict.fromkeys(keys))
+    with ThreadPoolExecutor(max_workers=min(5, len(unique_keys))) as executor:
+        futures = {key: executor.submit(load_one, *key) for key in unique_keys}
+        return [futures[key].result() for key in keys]

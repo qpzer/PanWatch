@@ -20,8 +20,34 @@ COPY frontend/ ./
 RUN pnpm build
 
 
-# ===== Stage 2: Python 运行环境 =====
-FROM python:3.11-slim
+# ===== Stage 2: Python 依赖构建 =====
+# 构建与运行使用相同的 Python / Debian 版本，保证原生 wheel 的 ABI 一致。
+FROM python:3.11-slim-bookworm AS python-builder
+
+WORKDIR /app
+
+# 本地构建：Debian 官方源在国内几乎不可达，先切清华 TUNA 镜像
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+
+# 本地构建：TradingAgents 源码已 vendor 到仓内（GitHub 直连不稳定；
+# PyPI 同名包源码不同且用了 Python 3.12 语法，与 3.11 镜像不兼容，必须用 tag 源码），
+# 因此不需要上游 builder 阶段的 git 安装。
+COPY requirements-runtime.txt ./
+COPY packages/ ./packages/
+COPY vendor/ ./vendor/
+
+# 本地开发保留 editable 安装；镜像内安装正常包，不依赖源码目录。
+# 不预编译字节码，避免把 .pyc 缓存打进镜像。
+# 本地构建：PyPI 官方源国内不稳定，切清华 TUNA 镜像
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    && sed 's/^-e //' requirements-runtime.txt > /tmp/requirements-runtime.txt \
+    && pip install --no-cache-dir --no-compile --prefix=/install -r /tmp/requirements-runtime.txt \
+    && pip install --no-cache-dir --no-compile --prefix=/install ./vendor/TradingAgents
+
+
+# ===== Stage 3: Python 运行环境 =====
+FROM python:3.11-slim-bookworm
 
 # 版本号（构建时传入）
 ARG VERSION=dev
@@ -31,28 +57,28 @@ WORKDIR /app
 # 安装系统依赖
 # - tzdata: 时区数据（zoneinfo 模块需要）
 # - 中文字体（K线截图需要）
-# - Playwright Chromium 依赖的系统库
+# - Playwright 1.57 的 Debian 12 Chromium 依赖（无头截图）
+#   https://github.com/microsoft/playwright/blob/v1.57.0/packages/playwright-core/src/server/registry/nativeDeps.ts
+# 固定 Bookworm：Trixie 的 libgbm1 会强制引入 Mesa / LLVM 图形驱动栈。
+# 不额外安装 GTK / EGL，截图使用 Chromium 自带的软件渲染。
 # 本地构建：Debian 官方源在国内几乎不可达，先切清华 TUNA 镜像
 RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' \
         /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
-    # git: requirements.txt 中含 git+https 直链(tradingagents)
-    git \
     # 中文字体
     fonts-noto-cjk \
-    # Playwright Chromium 依赖
-    # (这些库缺失会导致 playwright 提示 Host system is missing dependencies)
-    libxcursor1 \
-    libgtk-3-0 \
+    # PDF 导出所需的字体排版库
+    libpangoft2-1.0-0 \
     libpangocairo-1.0-0 \
-    libcairo-gobject2 \
-    libgdk-pixbuf-2.0-0 \
+    # Playwright Chromium 依赖
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
+    libatspi2.0-0 \
     libcups2 \
+    libdbus-1-3 \
     libdrm2 \
     libxkbcommon0 \
     libxcomposite1 \
@@ -63,37 +89,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     libpango-1.0-0 \
     libcairo2 \
-    # 常见的 Chromium 运行时依赖（不同版本/发行版可能会缺）
     libx11-6 \
-    libx11-xcb1 \
     libxcb1 \
     libxext6 \
-    libxi6 \
-    libxrender1 \
-    libxss1 \
-    libxtst6 \
-    libxshmfence1 \
-    libegl1 \
     libfontconfig1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
     && fc-cache -fv
 
-# 复制依赖文件
-COPY requirements.txt ./
-
-# 复制本仓内本地包(requirements.txt 里 -e ./packages/marketdata 需要它先在)
-COPY packages/ ./packages/
-
-# 本地构建：tradingagents 源码已 vendor 到仓内（GitHub 直连不稳定；
-# PyPI 同名包源码不同且用了 Python 3.12 语法，与 3.11 镜像不兼容，必须用 tag 源码）
-COPY vendor/ ./vendor/
-
-# 安装 Python 依赖
-# 本地构建：PyPI 官方源国内不稳定，切清华 TUNA 镜像
-RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-    && pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir ./vendor/TradingAgents
+# 仅复制安装产物，构建工具和本地包测试留在 builder 中。
+COPY --from=python-builder /install/ /usr/local/
 
 # 注意: Playwright 浏览器将在首次启动时自动安装到 data 目录
 # 这样可以减小镜像体积，并支持跨版本持久化
@@ -114,6 +119,7 @@ RUN mkdir -p /app/data
 
 # 环境变量
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 ENV DATA_DIR=/app/data
 ENV DOCKER=1
 

@@ -22,6 +22,7 @@ from src.platform.persistence.models import (
 from src.platform.observability.log_handler import DBLogHandler
 from src.platform.runtime.config import Settings, AppConfig, StockConfig
 from src.platform.marketdata.models import MarketCode
+from src.platform.marketdata.javascript_runtime import warmup_javascript_runtime
 from src.platform.ai.ai_client import AIClient
 from src.platform.ai.ai_failover import build_failover_client
 from src.platform.notifications.notifier import NotifierManager
@@ -38,8 +39,6 @@ from src.modules.automation.agent_catalog import (
 from src.modules.strategy.strategy_catalog import ensure_strategy_catalog
 from src.modules.automation.base import AgentContext, PortfolioInfo, AccountInfo, PositionInfo
 from src.modules.automation.daily_report import DailyReportAgent
-from src.modules.automation.news_digest import NewsDigestAgent
-from src.modules.automation.chart_analyst import ChartAnalystAgent
 from src.modules.automation.intraday_monitor import IntradayMonitorAgent
 from src.modules.automation.premarket_outlook import PremarketOutlookAgent
 from src.modules.automation.tradingagents import TradingAgentsAgent
@@ -241,34 +240,21 @@ def setup_playwright():
         logger.info("本地开发环境，使用系统 Playwright")
         return
 
-    # 检查是否已安装
-    if os.path.exists(browser_dir):
-        try:
-            dirs = os.listdir(browser_dir)
-            if any(
-                d.startswith("chromium")
-                for d in dirs
-                if os.path.isdir(os.path.join(browser_dir, d))
-            ):
-                logger.info(f"Playwright 浏览器已就绪: {browser_dir}")
-                return
-        except Exception:
-            pass
-
-    # 首次安装
-    logger.info("首次启动，正在安装 Playwright 浏览器（可能需要几分钟）...")
+    # install 会复用当前版本的缓存，并补齐旧缓存缺少的 headless shell。
+    # 不能仅检查 chromium* 目录：挂载卷中可能只有旧版本或完整浏览器。
+    logger.info("正在检查 Playwright 无头浏览器（首次安装可能需要几分钟）...")
     os.makedirs(browser_dir, exist_ok=True)
 
     try:
         result = subprocess.run(
-            ["playwright", "install", "chromium"],
+            ["playwright", "install", "chromium", "--only-shell"],
             env={**os.environ, "PLAYWRIGHT_BROWSERS_PATH": browser_dir},
             capture_output=True,
             text=True,
             timeout=600,  # 10 分钟超时
         )
         if result.returncode == 0:
-            logger.info("Playwright 浏览器安装完成")
+            logger.info("Playwright 无头浏览器已就绪")
         else:
             logger.error(f"Playwright 安装失败: {result.stderr}")
     except subprocess.TimeoutExpired:
@@ -928,6 +914,16 @@ def _get_app_setting(key: str) -> str:
         db.close()
 
 
+def _get_report_language() -> str:
+    from src.platform.language import resolve_report_language
+
+    db = SessionLocal()
+    try:
+        return resolve_report_language(db)
+    finally:
+        db.close()
+
+
 def resolve_ai_model(
     agent_name: str, stock_agent_id: int | None = None
 ) -> tuple[AIModel | None, AIService | None]:
@@ -1098,6 +1094,7 @@ def build_context(agent_name: str, stock_agent_id: int | None = None) -> AgentCo
         portfolio=portfolio,
         model_label=model_label,
         notify_policy=getattr(notifier, "policy", None),
+        report_language=_get_report_language(),
     )
 
 
@@ -1105,8 +1102,6 @@ def build_context(agent_name: str, stock_agent_id: int | None = None) -> AgentCo
 AGENT_REGISTRY: dict[str, type] = {
     "daily_report": DailyReportAgent,
     "premarket_outlook": PremarketOutlookAgent,
-    "news_digest": NewsDigestAgent,
-    "chart_analyst": ChartAnalystAgent,
     "intraday_monitor": IntradayMonitorAgent,
     "tradingagents": TradingAgentsAgent,
 }
@@ -1135,8 +1130,9 @@ def build_scheduler() -> AgentScheduler:
             if not agent_cls:
                 logger.warning(f"Agent {cfg.name} 未在 AGENT_REGISTRY 中注册")
                 continue
-            if not cfg.schedule:
-                logger.info(f"Agent {cfg.name} 未设置调度计划，跳过")
+            from src.modules.automation.scheduling_policy import schedule_plans
+            plans = schedule_plans(db, cfg)
+            if not plans:
                 continue
 
             agent_kwargs = cfg.config or {}
@@ -1146,11 +1142,12 @@ def build_scheduler() -> AgentScheduler:
                 )
             except TypeError:
                 agent_instance = agent_cls()
-            sched.register(
-                agent_instance,
-                schedule=cfg.schedule,
-                execution_mode=cfg.execution_mode or "batch",
-            )
+            for plan in plans:
+                sched.register(
+                    agent_instance, schedule=plan.schedule,
+                    execution_mode=cfg.execution_mode or "batch",
+                    stock_keys=plan.stock_keys, stock_agent_id=plan.stock_agent_id,
+                )
     finally:
         db.close()
 
@@ -1198,6 +1195,7 @@ def reload_scheduler() -> bool:
             except Exception:
                 pass
         scheduler = build_scheduler()
+        register_mcp_log_cleanup(scheduler)
         try:
             scheduler.start()
         except RuntimeError:
@@ -1329,10 +1327,12 @@ async def trigger_agent(agent_name: str) -> str:
                 )
                 return result.content
         except Exception as e:
+            from src.platform.ai.errors import safe_ai_error_message
+
             record_agent_run(
                 agent_name=agent_name,
                 status="failed",
-                error=str(e),
+                error=safe_ai_error_message(e),
                 duration_ms=int((time.monotonic() - start) * 1000),
                 trace_id=trace_id,
                 trigger_source="manual",
@@ -1402,6 +1402,7 @@ async def trigger_agent_for_stock(
         portfolio=portfolio,
         model_label=model_label,
         suppress_notify=suppress_notify,
+        report_language=_get_report_language(),
     )
     # 暴露 trace_id / force_refresh 给 agent(供 TradingAgents 进度反馈 + 缓存控制使用)。
     # AgentContext 不强制声明此字段,通过 setattr 注入,其他 agent 不受影响。
@@ -1450,10 +1451,12 @@ async def trigger_agent_for_stock(
                 model_label=context.model_label,
             )
         except Exception as e:
+            from src.platform.ai.errors import safe_ai_error_message
+
             record_agent_run(
                 agent_name=agent_name,
                 status="failed",
-                error=str(e),
+                error=safe_ai_error_message(e),
                 duration_ms=int((time.monotonic() - start) * 1000),
                 trace_id=trace_id,
                 trigger_source="manual",
@@ -1494,6 +1497,9 @@ async def lifespan(app):
     setup_proxy()  # 设置进程 env 代理(HTTP_PROXY/NO_PROXY);所有 httpx(trust_env=True)据此走代理
     setup_ssl()
     setup_playwright()
+    # Complete V8's first isolate initialization before market data workers race
+    # to create their first MiniRacer contexts (native fatal on macOS).
+    warmup_javascript_runtime()
 
     # 从环境变量初始化认证（Docker 部署用）
     from src.modules.administration.api.auth import init_auth_from_env
@@ -1538,14 +1544,13 @@ async def lifespan(app):
 
     threading.Thread(target=refresh_stock_cache, daemon=True).start()
 
-    # 交易日历预热(判断周末/法定节假日是否开市)。拉取失败会自动降级为只判周末,
-    # 因此这里不阻塞启动,交给后台任务;之后每日 03:00 由上下文维护调度器刷新。
+    # 预热本地近期交易日历,不请求全历史数据;未公布年度不会授权自动交易。
     try:
         from src.platform.scheduling.trading_calendar import refresh as refresh_trading_calendar
 
         asyncio.create_task(refresh_trading_calendar())
     except Exception as e:
-        logger.warning(f"交易日历预热调度失败(降级为只判周末): {e}")
+        logger.warning(f"交易日历预热调度失败: {e}")
 
     global scheduler, price_alert_scheduler, paper_trading_scheduler, context_maintenance_scheduler
     global _MAIN_LOOP
@@ -1580,7 +1585,8 @@ async def lifespan(app):
         settings = Settings()
         context_maintenance_scheduler = ContextMaintenanceScheduler(
             timezone=settings.app_timezone,
-            eval_interval_hours=6,
+            evaluation_hour=4,
+            evaluation_minute=30,
             snapshot_retention_days=180,
             outcome_retention_days=365,
         )
@@ -1593,23 +1599,28 @@ async def lifespan(app):
         register_mcp_log_cleanup(scheduler)
     except Exception as e:
         logger.error(f"MCP 日志清理任务注册失败: {e}")
-    yield
-    if scheduler:
-        scheduler.shutdown()
-        logger.info("Agent 调度器已关闭")
-    if price_alert_scheduler:
-        price_alert_scheduler.shutdown()
-        logger.info("价格提醒调度器已关闭")
-    if paper_trading_scheduler:
-        paper_trading_scheduler.shutdown()
-        logger.info("模拟盘调度器已关闭")
-    if context_maintenance_scheduler:
-        context_maintenance_scheduler.shutdown()
-        logger.info("上下文维护调度器已关闭")
+    try:
+        # Preserve FastAPI's original lifespan, including registered recovery
+        # hooks. Database initialization must precede this context.
+        async with application_lifespan(app):
+            yield
+    finally:
+        if scheduler:
+            scheduler.shutdown()
+            logger.info("Agent 调度器已关闭")
+        if price_alert_scheduler:
+            price_alert_scheduler.shutdown()
+            logger.info("价格提醒调度器已关闭")
+        if paper_trading_scheduler:
+            paper_trading_scheduler.shutdown()
+            logger.info("模拟盘调度器已关闭")
+        if context_maintenance_scheduler:
+            context_maintenance_scheduler.shutdown()
+            logger.info("上下文维护调度器已关闭")
 
 
 # 模块级 app 实例，供 uvicorn reload 使用
-from src.bootstrap.application import app  # noqa: E402
+from src.bootstrap.application import app, application_lifespan  # noqa: E402
 
 app.router.lifespan_context = lifespan
 

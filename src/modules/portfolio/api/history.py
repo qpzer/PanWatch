@@ -15,9 +15,10 @@ from src.platform.runtime.config import Settings
 from src.modules.automation.agent_catalog import (
     AGENT_KIND_CAPABILITY,
     AGENT_KIND_WORKFLOW,
-    CAPABILITY_AGENT_NAMES,
+    LEGACY_CAPABILITY_AGENT_NAMES,
     infer_agent_kind,
 )
+from src.web.errors import api_error
 
 
 def _format_datetime(dt) -> str:
@@ -95,7 +96,7 @@ def list_history(
                         AnalysisHistory.agent_kind_snapshot.is_(None),
                         AnalysisHistory.agent_kind_snapshot == "",
                     ),
-                    AnalysisHistory.agent_name.in_(CAPABILITY_AGENT_NAMES),
+                    AnalysisHistory.agent_name.in_(LEGACY_CAPABILITY_AGENT_NAMES),
                 ),
             )
         )
@@ -108,7 +109,7 @@ def list_history(
                         AnalysisHistory.agent_kind_snapshot.is_(None),
                         AnalysisHistory.agent_kind_snapshot == "",
                     ),
-                    ~AnalysisHistory.agent_name.in_(CAPABILITY_AGENT_NAMES),
+                    ~AnalysisHistory.agent_name.in_(LEGACY_CAPABILITY_AGENT_NAMES),
                 ),
             )
         )
@@ -154,9 +155,7 @@ def get_history_detail(
     """获取单条分析详情"""
     record = db.query(AnalysisHistory).filter(AnalysisHistory.id == history_id).first()
     if not record:
-        from fastapi import HTTPException
-
-        raise HTTPException(404, "记录不存在")
+        raise api_error(404, "analysis_record_not_found", "记录不存在")
 
     return HistoryResponse(
         id=record.id,
@@ -196,9 +195,7 @@ def delete_history(history_id: int, db: Session = Depends(get_db)):
     """删除单条历史记录"""
     record = db.query(AnalysisHistory).filter(AnalysisHistory.id == history_id).first()
     if not record:
-        from fastapi import HTTPException
-
-        raise HTTPException(404, "记录不存在")
+        raise api_error(404, "analysis_record_not_found", "记录不存在")
 
     db.delete(record)
     db.commit()

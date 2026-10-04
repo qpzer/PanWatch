@@ -3,7 +3,7 @@ import logging
 import threading
 from types import SimpleNamespace
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -20,7 +20,12 @@ from src.platform.persistence.models import (
 from src.platform.marketdata.stock_list import search_stocks, refresh_stock_list
 from src.platform.marketdata.marketdata_client import md_quote_rows
 from src.platform.marketdata.models import MarketCode, MARKETS
+from src.platform.marketdata.quote_display import daily_quote_fields
+from src.platform.scheduling import trading_calendar
+from src.platform.scheduling.schedule_parser import parse_schedule
+from src.modules.automation.scheduling_policy import request_scheduler_reload
 from src.modules.automation.agent_catalog import AGENT_KIND_WORKFLOW, infer_agent_kind
+from src.web.errors import api_error
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -119,42 +124,22 @@ def _stock_to_response(stock: Stock, agent_display_names: dict[str, str] | None 
 @router.get("/markets/status")
 def get_market_status():
     """获取各市场的交易状态"""
-    from datetime import datetime
-
     result = []
     for market_code, market_def in MARKETS.items():
         try:
-            now = datetime.now(market_def.get_tz())
-            is_trading = market_def.is_trading_time()
+            now = trading_calendar._now_in_market_tz(market_code)
+            status = trading_calendar.market_status(market_code, now)
+            is_trading = status == "trading"
 
             # 获取交易时段描述
             sessions_desc = []
-            for session in market_def.sessions:
+            for session in trading_calendar.trading_sessions(market_code, now):
                 sessions_desc.append(f"{session.start.strftime('%H:%M')}-{session.end.strftime('%H:%M')}")
 
-            # 判断状态
-            weekday = now.weekday()
-            current_time = now.time()
-
-            if weekday >= 5:
-                status = "closed"
-                status_text = "休市（周末）"
-            elif is_trading:
-                status = "trading"
-                status_text = "交易中"
-            else:
-                # 判断是盘前还是盘后
-                first_session = market_def.sessions[0]
-                last_session = market_def.sessions[-1]
-                if current_time < first_session.start:
-                    status = "pre_market"
-                    status_text = "盘前"
-                elif current_time > last_session.end:
-                    status = "after_hours"
-                    status_text = "已收盘"
-                else:
-                    status = "break"
-                    status_text = "午间休市"
+            status_text = {
+                "closed": "休市", "trading": "交易中", "pre_market": "盘前",
+                "after_hours": "已收盘", "break": "午间休市", "unknown": "未知",
+            }[status]
 
             result.append({
                 "code": market_code.value,
@@ -164,6 +149,7 @@ def get_market_status():
                 "is_trading": is_trading,
                 "sessions": sessions_desc,
                 "local_time": now.strftime("%H:%M"),
+                "local_date": now.date().isoformat(),
                 "timezone": market_def.timezone,
             })
         except Exception as e:
@@ -182,6 +168,27 @@ def get_market_status():
             })
 
     return result
+
+
+@router.get("/markets/calendar")
+def get_market_calendars(days: int = Query(default=14, ge=1, le=31), timezone: str = "Asia/Shanghai"):
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        display_tz = ZoneInfo(timezone)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise api_error(400, "timezone_invalid", "时区无效") from exc
+    now = trading_calendar._now_in_market_tz(MarketCode.CN).astimezone(display_tz)
+    return {"timezone": timezone, "start_date": now.date().isoformat(),
+            "markets": [trading_calendar.upcoming_calendar(code, days=days, start_date=now.date())
+                        for code in MARKETS]}
+
+
+@router.get("/markets/{market}/calendar")
+def get_market_calendar(market: str, days: int = Query(default=14, ge=1, le=31)):
+    code = trading_calendar._to_market_code(market)
+    if code is None:
+        raise api_error(400, "market_invalid", "市场代码无效")
+    return trading_calendar.upcoming_calendar(code, days=days)
 
 
 @router.get("/search")
@@ -232,6 +239,7 @@ def get_quotes(db: Session = Depends(get_db)):
                     "change_pct": item["change_pct"],
                     "change_amount": item["change_amount"],
                     "prev_close": item["prev_close"],
+                    **daily_quote_fields(market, item),
                 }
         except Exception as e:
             logger.error(f"获取 {market} 行情失败: {e}")
@@ -245,7 +253,7 @@ def create_stock(stock: StockCreate, db: Session = Depends(get_db)):
         Stock.symbol == stock.symbol, Stock.market == stock.market
     ).first()
     if existing:
-        raise HTTPException(400, f"股票 {stock.symbol} 已存在")
+        raise api_error(400, "stock_already_exists", f"股票 {stock.symbol} 已存在")
 
     max_order = db.query(func.max(Stock.sort_order)).scalar() or 0
     db_stock = Stock(**stock.model_dump(), sort_order=int(max_order) + 1)
@@ -277,7 +285,7 @@ def reorder_stocks(body: StockReorderRequest, db: Session = Depends(get_db)):
 def update_stock(stock_id: int, stock: StockUpdate, db: Session = Depends(get_db)):
     db_stock = db.query(Stock).filter(Stock.id == stock_id).first()
     if not db_stock:
-        raise HTTPException(404, "股票不存在")
+        raise api_error(404, "stock_not_found", "股票不存在")
 
     for key, value in stock.model_dump(exclude_unset=True).items():
         setattr(db_stock, key, value)
@@ -291,12 +299,12 @@ def update_stock(stock_id: int, stock: StockUpdate, db: Session = Depends(get_db
 def delete_stock(stock_id: int, db: Session = Depends(get_db)):
     db_stock = db.query(Stock).filter(Stock.id == stock_id).first()
     if not db_stock:
-        raise HTTPException(404, "股票不存在")
+        raise api_error(404, "stock_not_found", "股票不存在")
 
     # 删除股票前，要求先清理持仓，避免误删资产数据。
     has_position = db.query(Position.id).filter(Position.stock_id == stock_id).first()
     if has_position:
-        raise HTTPException(400, "该股票存在持仓，请先删除持仓后再删除股票")
+        raise api_error(400, "stock_has_position", "该股票存在持仓，请先删除持仓后再删除股票")
 
     # SQLite 默认可能不启用 FK 级联，手动清理提醒数据避免孤儿记录。
     rule_ids = [
@@ -321,6 +329,7 @@ def delete_stock(stock_id: int, db: Session = Depends(get_db)):
 
     db.delete(db_stock)
     db.commit()
+    request_scheduler_reload()
     return {"ok": True}
 
 
@@ -329,15 +338,20 @@ def update_stock_agents(stock_id: int, body: StockAgentUpdate, db: Session = Dep
     """更新股票关联的 Agent 列表（含调度配置和 AI/通知覆盖）"""
     db_stock = db.query(Stock).filter(Stock.id == stock_id).first()
     if not db_stock:
-        raise HTTPException(404, "股票不存在")
+        raise api_error(404, "stock_not_found", "股票不存在")
 
     for item in body.agents:
+        if item.schedule:
+            try:
+                parse_schedule(item.schedule)
+            except ValueError as exc:
+                raise api_error(400, "agent_schedule_invalid", "调度表达式无法解析") from exc
         agent = db.query(AgentConfig).filter(AgentConfig.name == item.agent_name).first()
         if not agent:
-            raise HTTPException(400, f"Agent {item.agent_name} 不存在")
+            raise api_error(400, "agent_not_found", f"Agent {item.agent_name} 不存在")
         agent_kind = (agent.kind or "").strip() or infer_agent_kind(agent.name)
         if agent_kind != AGENT_KIND_WORKFLOW:
-            raise HTTPException(400, f"Agent {item.agent_name} 为内部能力，不支持绑定到股票")
+            raise api_error(400, "agent_binding_unsupported", f"Agent {item.agent_name} 为内部能力，不支持绑定到股票")
 
     # 清除旧关联，重建
     db.query(StockAgent).filter(StockAgent.stock_id == stock_id).delete()
@@ -352,6 +366,7 @@ def update_stock_agents(stock_id: int, body: StockAgentUpdate, db: Session = Dep
 
     db.commit()
     db.refresh(db_stock)
+    request_scheduler_reload()
     return _stock_to_response(db_stock, _agent_display_names(db, [db_stock]))
 
 
@@ -383,25 +398,25 @@ async def trigger_stock_agent(
     if stock_id > 0:
         db_stock = db.query(Stock).filter(Stock.id == stock_id).first()
         if not db_stock:
-            raise HTTPException(404, "股票不存在")
+            raise api_error(404, "stock_not_found", "股票不存在")
 
         sa = db.query(StockAgent).filter(
             StockAgent.stock_id == stock_id, StockAgent.agent_name == agent_name
         ).first()
         if not sa and not allow_unbound:
-            raise HTTPException(400, f"股票未关联 Agent {agent_name}")
+            raise api_error(400, "stock_agent_not_bound", f"股票未关联 Agent {agent_name}")
         if not sa and allow_unbound:
             # 允许无绑定触发时，至少确保 Agent 存在。
             agent = db.query(AgentConfig).filter(AgentConfig.name == agent_name).first()
             if not agent:
-                raise HTTPException(400, f"Agent {agent_name} 不存在")
+                raise api_error(400, "agent_not_found", f"Agent {agent_name} 不存在")
         trigger_stock = db_stock
     else:
         symbol = (symbol or "").strip()
         if not symbol:
-            raise HTTPException(400, "当 stock_id<=0 时，symbol 不能为空")
+            raise api_error(400, "stock_symbol_required", "当 stock_id<=0 时，symbol 不能为空")
         if not allow_unbound:
-            raise HTTPException(400, "当 stock_id<=0 时，需设置 allow_unbound=true")
+            raise api_error(400, "stock_agent_unbound_not_allowed", "当 stock_id<=0 时，需设置 allow_unbound=true")
 
         market = (market or "CN").strip().upper() or "CN"
         name = (name or "").strip() or symbol
@@ -417,7 +432,7 @@ async def trigger_stock_agent(
             # 不落库：用于详情弹窗未持仓且未关注股票的一次性分析。
             agent = db.query(AgentConfig).filter(AgentConfig.name == agent_name).first()
             if not agent:
-                raise HTTPException(400, f"Agent {agent_name} 不存在")
+                raise api_error(400, "agent_not_found", f"Agent {agent_name} 不存在")
             trigger_stock = SimpleNamespace(
                 id=0,
                 symbol=symbol,
@@ -533,7 +548,8 @@ async def trigger_stock_agent(
             "message": result.get("message", "ok"),
         }
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        logger.warning("股票 Agent %s 执行参数无效: %s", agent_name, e)
+        raise api_error(400, "agent_trigger_invalid", "Agent 执行参数无效") from e
     except Exception as e:
         logger.error(f"Agent {agent_name} 执行失败 - {trigger_stock.symbol}: {e}")
-        raise HTTPException(500, f"Agent 执行失败: {e}")
+        raise api_error(500, "agent_trigger_failed", "Agent 执行失败") from e
