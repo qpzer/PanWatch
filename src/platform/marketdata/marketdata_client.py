@@ -34,21 +34,10 @@ class DbConfigProvider:
             db.close()
 
     def sources_for(self, datatype: str, market: str | None) -> list[SourceConfig]:
-        market_code = (market or "").strip().upper()
         rows = self._query_rows(datatype)
-        has_us_fallback = any(
-            row.provider in {"stooq", "yahoo"} for row in rows
-        )
         sources = []
         for row in rows:
-            # 腾讯美股接口在当前网络出口稳定返回 501；A/HK 仍保留腾讯作为主源。
-            if (
-                datatype == "kline"
-                and market_code == "US"
-                and row.provider == "tencent"
-                and has_us_fallback
-            ):
-                continue
+            # 保留配置的主备链；单个环境的供应商故障应由 Engine 回退，不能永久排除。
             sources.append(
                 SourceConfig(
                     vendor=row.provider,
@@ -98,6 +87,7 @@ def _quote_to_row(q: Quote) -> dict:
         "pe_ratio": q.pe_ratio,
         "circulating_market_value": q.circulating_market_value,
         "total_market_value": q.total_market_value,
+        "quote_date": q.quote_date.isoformat() if q.quote_date else None,
     }
 
 

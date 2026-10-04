@@ -1,15 +1,17 @@
 """盘中监测 Agent - 实时监控持仓，AI 判断是否需要提醒"""
 
 import json
+import asyncio
 import logging
 import re
 import uuid
 from datetime import datetime, timedelta, date, timezone
 from pathlib import Path
 
+from src.modules.research.signals.actions import ACTION_LABELS, ACTION_LABELS_EN, normalize_suggestion
 from src.modules.automation.base import BaseAgent, AgentContext, AnalysisResult
 from src.platform.marketdata.collectors.kline_collector import KlineCollector
-from src.modules.research.analysis_history import get_latest_analysis, get_analysis
+from src.modules.research.analysis_history import get_scoped_analysis_context
 from src.modules.research.context_builder import ContextBuilder
 from src.modules.research.context_store import (
     save_agent_context_run,
@@ -31,7 +33,13 @@ def is_market_trading(market: MarketCode) -> bool:
     return market_def.is_trading_time()
 
 
-def market_label(market: MarketCode) -> str:
+def market_label(market: MarketCode, language: str = "zh-CN") -> str:
+    if language == "en-US":
+        return {
+            MarketCode.CN: "A-shares",
+            MarketCode.HK: "Hong Kong market",
+            MarketCode.US: "U.S. market",
+        }.get(market, market.value)
     if market == MarketCode.CN:
         return "A股"
     if market == MarketCode.HK:
@@ -43,6 +51,7 @@ def market_label(market: MarketCode) -> str:
 
 # 标准化操作建议
 SUGGESTION_TYPES = {
+    **{label: action for action, label in ACTION_LABELS.items()},
     "建仓": "buy",  # 新开仓位
     "加仓": "add",  # 增加现有仓位
     "减仓": "reduce",  # 减少仓位
@@ -113,7 +122,11 @@ class IntradayMonitorAgent(BaseAgent):
 
         # 按股票所属市场做交易时段门禁（而非全局任一市场开盘）
         if not self.bypass_market_hours and not is_market_trading(market):
-            msg = f"当前{market_label(market)}非交易时段，已跳过执行"
+            msg = (
+                f"The {market_label(market, context.report_language)} is closed; the run was skipped."
+                if context.report_language == "en-US"
+                else f"当前{market_label(market)}非交易时段，已跳过执行"
+            )
             logger.info(f"{msg}: {symbol}")
             return {
                 "stocks": [],
@@ -153,15 +166,11 @@ class IntradayMonitorAgent(BaseAgent):
         kline_summary = pack.technical if pack else None
 
         # 获取历史分析（为 AI 提供更多上下文）
-        daily_analysis = get_latest_analysis(
-            agent_name="daily_report",
-            stock_symbol="*",
-            before_date=date.today(),
+        daily_analysis = await asyncio.to_thread(
+            get_scoped_analysis_context, "daily_report", [stock_config], before_date=date.today(),
         )
-        premarket_analysis = get_analysis(
-            agent_name="premarket_outlook",
-            stock_symbol="*",
-            analysis_date=date.today(),
+        premarket_analysis = await asyncio.to_thread(
+            get_scoped_analysis_context, "premarket_outlook", [stock_config], analysis_date=date.today(),
         )
 
         return {
@@ -547,6 +556,8 @@ class IntradayMonitorAgent(BaseAgent):
         if obj:
             action = (obj.get("action") or "watch").strip()
             result["action"] = action
+            result["attention_required"] = bool(obj.get("attention_required"))
+            result["review_required"] = bool(obj.get("review_required"))
             result["action_label"] = (
                 obj.get("action_label") or result["action_label"]
             ).strip()[:20]
@@ -571,14 +582,14 @@ class IntradayMonitorAgent(BaseAgent):
             result["risks"] = (
                 obj.get("risks") if isinstance(obj.get("risks"), list) else []
             )
-            return result
+            return normalize_suggestion(result)
 
         # 检查是否无需提醒
         if "[无需提醒]" in content:
             result["should_alert"] = False
             result["action"] = "hold"
             result["action_label"] = "持有"
-            return result
+            return normalize_suggestion(result)
 
         # 提取建议类型（从全文搜索）
         for label, action in SUGGESTION_TYPES.items():
@@ -642,7 +653,7 @@ class IntradayMonitorAgent(BaseAgent):
 
         # 最终 should_alert 判定：只在明确“建仓/加仓/减仓/清仓”时提醒
         result["should_alert"] = result["action"] in {"buy", "add", "reduce", "sell"}
-        return result
+        return normalize_suggestion(result)
 
     def _try_parse_loose_json(self, text: str) -> dict | None:
         """宽松解析 JSON 输出，兜底兼容模型异常格式。"""
@@ -685,12 +696,26 @@ class IntradayMonitorAgent(BaseAgent):
         return obj
 
     def _format_human_readable_content(
-        self, stock: StockData, suggestion: dict, raw_content: str
+        self,
+        stock: StockData,
+        suggestion: dict,
+        raw_content: str,
+        report_language: str,
     ) -> str:
         """当模型返回 JSON 时，生成可读通知内容。"""
-        action_label = suggestion.get("action_label") or "观望"
-        signal = suggestion.get("signal") or "无明显新信号"
-        reason = suggestion.get("reason") or "请结合盘面与风控策略审慎判断。"
+        english = report_language == "en-US"
+        action = suggestion.get("action", "watch")
+        action_label = (ACTION_LABELS_EN if english else ACTION_LABELS).get(action, "Watch" if english else "观望")
+        if suggestion.get("review_required"):
+            action_label = "Review required" if english else "待复核"
+        elif action == "watch" and suggestion.get("attention_required"):
+            action_label = "Alert" if english else "提醒"
+        signal = suggestion.get("signal") or ("No notable new signal" if english else "无明显新信号")
+        reason = suggestion.get("reason") or (
+            "Use market conditions and risk controls before making a decision."
+            if english
+            else "请结合盘面与风控策略审慎判断。"
+        )
         triggers = (
             suggestion.get("triggers")
             if isinstance(suggestion.get("triggers"), list)
@@ -708,51 +733,64 @@ class IntradayMonitorAgent(BaseAgent):
             f"{stock.current_price:.2f}" if getattr(stock, "current_price", None) else "N/A"
         )
         chg = f"{(stock.change_pct or 0):+.2f}%"
-        lines = [
-            f"{stock.name}（{stock.symbol}）",
-            f"现价：{price}  涨跌：{chg}",
-            f"建议：{action_label}",
-            f"信号：{signal}",
-            f"理由：{reason}",
-        ]
+        lines = (
+            [
+                f"{stock.name} ({stock.symbol})",
+                f"Current price: {price}  Change: {chg}",
+                f"Action: {action_label}",
+                f"Signal: {signal}",
+                f"Reason: {reason}",
+            ]
+            if english
+            else [
+                f"{stock.name}（{stock.symbol}）",
+                f"现价：{price}  涨跌：{chg}",
+                f"建议：{action_label}",
+                f"信号：{signal}",
+                f"理由：{reason}",
+            ]
+        )
         if triggers:
-            lines.append("触发条件：")
+            lines.append("Triggers:" if english else "触发条件：")
             lines.extend([f"- {str(x)}" for x in triggers[:3]])
         if invalidations:
-            lines.append("失效条件：")
+            lines.append("Invalidation conditions:" if english else "失效条件：")
             lines.extend([f"- {str(x)}" for x in invalidations[:3]])
         if risks:
-            lines.append("风险提示：")
+            lines.append("Risk notes:" if english else "风险提示：")
             lines.extend([f"- {str(x)}" for x in risks[:3]])
         # 若本次并非纯 JSON，附上简短原文摘要便于核对
         if not (try_parse_action_json(raw_content) or self._try_parse_loose_json(raw_content)):
             brief = re.sub(r"\s+", " ", (raw_content or "").strip())[:200]
             if brief:
-                lines.append(f"备注：{brief}")
+                lines.append(f"Note: {brief}" if english else f"备注：{brief}")
         return "\n".join(lines)
 
     async def analyze(self, context: AgentContext, data: dict) -> AnalysisResult:
         """AI 分析并判断是否需要提醒"""
         # 非交易时段跳过
         if data.get("skip_reason"):
+            english = context.report_language == "en-US"
             return AnalysisResult(
                 agent_name=self.name,
-                title=f"【{self.display_name}】跳过",
-                content=data.get("skip_reason", "跳过执行"),
+                title="[Intraday monitor] Skipped" if english else f"【{self.display_name}】跳过",
+                content=data.get("skip_reason", "Skipped" if english else "跳过执行"),
                 raw_data={"skipped": True, **data},
             )
 
         stock: StockData | None = data.get("stock_data")
 
         if not stock:
+            english = context.report_language == "en-US"
             return AnalysisResult(
                 agent_name=self.name,
-                title=f"【{self.display_name}】无数据",
-                content="未获取到股票数据",
-                raw_data=data,
+                title="[Intraday monitor] No data" if english else f"【{self.display_name}】无数据",
+                content="No stock data was available." if english else "未获取到股票数据",
+                raw_data={**data, "skipped": True},
             )
 
         system_prompt, user_content = self.build_prompt(data, context)
+        system_prompt = self.apply_report_language(context, system_prompt)
 
         # 打印完整 prompt 用于调试
         logger.info(f"=== Prompt for {stock.symbol} ===\n{user_content}")
@@ -773,10 +811,14 @@ class IntradayMonitorAgent(BaseAgent):
         )
         # JSON/类 JSON 输出时，统一转换为可读通知文本，避免渠道直接推送原始 JSON
         if try_parse_action_json(raw_content) or self._try_parse_loose_json(raw_content):
-            content = self._format_human_readable_content(stock, suggestion, raw_content)
+            content = self._format_human_readable_content(
+                stock, suggestion, raw_content, context.report_language
+            )
 
         # 保存到建议池（包含 prompt 上下文）
-        save_suggestion(
+        await asyncio.to_thread(
+            save_suggestion,
+            suggestion_state=suggestion,
             stock_symbol=stock.symbol,
             stock_name=stock.name,
             action=suggestion["action"],
@@ -784,7 +826,7 @@ class IntradayMonitorAgent(BaseAgent):
             signal=suggestion.get("signal", ""),
             reason=suggestion.get("reason", ""),
             agent_name=self.name,
-            agent_label=self.display_name,
+            agent_label=("Intraday monitor" if context.report_language == "en-US" else self.display_name),
             expires_hours=6,  # 盘中建议 6 小时有效
             prompt_context=user_content,  # 保存 prompt 上下文
             ai_response=raw_content,  # 保存 AI 原始响应
@@ -816,7 +858,8 @@ class IntradayMonitorAgent(BaseAgent):
         )
         prediction_group_id = str(uuid.uuid4())
         for horizon in (1, 5):
-            save_agent_prediction_outcome(
+            await asyncio.to_thread(
+                save_agent_prediction_outcome,
                 agent_name=self.name,
                 stock_symbol=stock.symbol,
                 stock_market=stock.market.value,
@@ -824,19 +867,26 @@ class IntradayMonitorAgent(BaseAgent):
                 horizon_days=horizon,
                 prediction_group_id=prediction_group_id,
                 action=suggestion.get("action") or "watch",
-                action_label=suggestion.get("action_label") or "观望",
+                action_label=suggestion.get("action_label") or (
+                    "Watch" if context.report_language == "en-US" else "观望"
+                ),
                 confidence=(float(quality_score) / 100.0)
                 if quality_score is not None
                 else None,
                 trigger_price=getattr(stock, "current_price", None),
                 meta={
+                    "suggestion_state": {
+                        "review_required": suggestion.get("review_required", False),
+                        "attention_required": suggestion.get("attention_required", False),
+                    },
                     "source": "intraday_monitor",
                     "reason": suggestion.get("reason", ""),
                     "signal": suggestion.get("signal", ""),
                 },
             )
 
-        save_agent_context_run(
+        await asyncio.to_thread(
+            save_agent_context_run,
             agent_name=self.name,
             stock_symbol=stock.symbol,
             analysis_date=analysis_date,
@@ -848,7 +898,11 @@ class IntradayMonitorAgent(BaseAgent):
         )
 
         # 构建标题
-        title = f"【{self.display_name}】{stock.name} {stock.change_pct:+.2f}%"
+        title = (
+            f"[Intraday monitor] {stock.name} {stock.change_pct:+.2f}%"
+            if context.report_language == "en-US"
+            else f"【{self.display_name}】{stock.name} {stock.change_pct:+.2f}%"
+        )
 
         # 附 AI 模型信息
         if context.model_label:
@@ -1046,7 +1100,7 @@ class IntradayMonitorAgent(BaseAgent):
                         f"Agent [{self.display_name}] 通知已发送: {stock_symbol}"
                     )
                     if not self.bypass_throttle:
-                        self._update_throttle(stock_symbol)
+                        await asyncio.to_thread(self._update_throttle, stock_symbol)
                 else:
                     notify_error = notify_result.get("error") or "未知错误"
                     result.raw_data["notify_error"] = notify_error

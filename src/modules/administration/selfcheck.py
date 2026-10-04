@@ -59,8 +59,45 @@ def classify_hint(category: str, error: str | None) -> str:
     return error or "未知错误,查看日志。"
 
 
+def classify_hint_code(category: str, error: str | None) -> str:
+    """Return a stable UI code for the same diagnosis as ``classify_hint``."""
+    e = (error or "").lower()
+    if category == "datasource":
+        if "database is locked" in e:
+            return "database_locked"
+        if any(k in e for k in ("server disconnected", "timeout", "timed out", "connect", "proxy", "ssl", "remote end closed", "read timed out", "connection reset")):
+            return "datasource_connection"
+        return "datasource_default"
+    if category == "ai":
+        if any(k in e for k in ("401", "unauthorized", "invalid_api_key", "api key", "incorrect api key", "authentication")):
+            return "ai_auth"
+        if any(k in e for k in ("model", "not found", "does not exist", "404")):
+            return "ai_model"
+        if any(k in e for k in ("429", "rate limit", "quota", "insufficient", "balance")):
+            return "ai_quota"
+        if any(k in e for k in ("connect", "timeout", "timed out", "proxy", "ssl", "getaddrinfo", "name resolution")):
+            return "ai_connection"
+        return "ai_default"
+    if category == "notify":
+        if any(k in e for k in ("invalid", "unsupported", "scheme", "malformed", "parse", "config")):
+            return "notify_config"
+        if any(k in e for k in ("forbidden", "unauthorized", "403", "401", "404", "blocked", "connect", "timeout")):
+            return "notify_delivery"
+        return "notify_default"
+    if category == "system":
+        if "lock" in e:
+            return "database_locked"
+        if any(k in e for k in ("disk", "space", "磁盘", "空间")):
+            return "disk_space"
+        if any(k in e for k in ("scheduler", "调度", "stopped", "not running")):
+            return "scheduler_stopped"
+        return "system_default"
+    return "unknown"
+
+
 def _item(category: str, key: str, name: str, status: str,
-          latency_ms: int, error: str | None = None, note: str | None = None) -> dict:
+          latency_ms: int, error: str | None = None, note: str | None = None,
+          note_code: str | None = None, note_params: dict | None = None) -> dict:
     return {
         "category": category,
         "key": key,
@@ -69,7 +106,10 @@ def _item(category: str, key: str, name: str, status: str,
         "latency_ms": int(latency_ms),
         "error": error,
         "hint": classify_hint(category, error) if status == "fail" else "",
+        "hint_code": classify_hint_code(category, error) if status == "fail" else "",
         "note": note,
+        "note_code": note_code,
+        "note_params": note_params or {},
     }
 
 
@@ -112,7 +152,12 @@ async def probe_ai_model(model, service) -> dict:
                      int((time.monotonic() - t0) * 1000), str(e))
 
 
-async def probe_notify_channel(channel, *, send: bool = False) -> dict:
+async def probe_notify_channel(
+    channel,
+    *,
+    send: bool = False,
+    report_language: str = "zh-CN",
+) -> dict:
     """默认只校验 URI 配置(add_channel 不通会抛);send=True 才真实发送。"""
     from src.platform.notifications.notifier import NotifierManager
 
@@ -124,9 +169,18 @@ async def probe_notify_channel(channel, *, send: bool = False) -> dict:
         if not send:
             latency = int((time.monotonic() - t0) * 1000)
             return _item("notify", f"nc:{channel.id}", name, "ok", latency,
-                         note="仅校验配置格式,未真实发送(勾选「含真实发送」可发测试消息)")
+                         note="仅校验配置格式,未真实发送(勾选「含真实发送」可发测试消息)",
+                         note_code="notify_config_only")
+        english = report_language == "en-US"
         result = await notifier.notify_with_result(
-            title="系统自检", content="盯盘侠系统自检测试消息。", bypass_quiet_hours=True)
+            title="System check" if english else "系统自检",
+            content=(
+                "This is a PanWatch system-check test notification."
+                if english
+                else "盯盘侠系统自检测试消息。"
+            ),
+            bypass_quiet_hours=True,
+        )
         latency = int((time.monotonic() - t0) * 1000)
         ok = bool(result.get("success"))
         return _item("notify", f"nc:{channel.id}", name, _status_for(ok, latency), latency,
@@ -136,7 +190,7 @@ async def probe_notify_channel(channel, *, send: bool = False) -> dict:
                      int((time.monotonic() - t0) * 1000), str(e))
 
 
-async def probe_db() -> dict:
+def _probe_db() -> dict:
     """对真实库执行 SELECT 1。"""
     from sqlalchemy import text
 
@@ -155,6 +209,9 @@ async def probe_db() -> dict:
         return _item("system", "sys:db", "数据库", "fail", int((time.monotonic() - t0) * 1000), str(e))
 
 
+async def probe_db() -> dict:
+    return await asyncio.to_thread(_probe_db)
+
 async def probe_disk() -> dict:
     """检查 data 目录所在盘的可用空间。"""
     import os
@@ -165,7 +222,7 @@ async def probe_disk() -> dict:
     t0 = time.monotonic()
     try:
         data_dir = os.path.dirname(os.path.abspath(DB_PATH))
-        usage = shutil.disk_usage(data_dir)
+        usage = await asyncio.to_thread(shutil.disk_usage, data_dir)
         free_gb = usage.free / (1024 ** 3)
         total_gb = usage.total / (1024 ** 3)
         note = f"可用 {free_gb:.1f}GB / 共 {total_gb:.1f}GB"
@@ -174,7 +231,8 @@ async def probe_disk() -> dict:
             return _item("system", "sys:disk", "磁盘空间", "fail", latency,
                          error=f"磁盘空间严重不足({note})", note=note)
         status = "slow" if free_gb < 1.0 else "ok"
-        return _item("system", "sys:disk", "磁盘空间", status, latency, note=note)
+        return _item("system", "sys:disk", "磁盘空间", status, latency, note=note,
+                     note_code="disk_capacity", note_params={"free": f"{free_gb:.1f}", "total": f"{total_gb:.1f}"})
     except Exception as e:
         return _item("system", "sys:disk", "磁盘空间", "fail", int((time.monotonic() - t0) * 1000), str(e))
 
@@ -186,7 +244,7 @@ async def probe_scheduler() -> dict:
     regs = scheduler_registry.get_all()
     if not regs:
         return _item("system", "sys:scheduler", "调度器", "ok", 0,
-                     note="当前进程无运行中的调度器(CLI 自检会跳过此项)")
+                     note="当前进程无运行中的调度器(CLI 自检会跳过此项)", note_code="scheduler_not_in_process")
     running: list[str] = []
     stopped: list[str] = []
     jobs = 0
@@ -203,7 +261,8 @@ async def probe_scheduler() -> dict:
         note = f"{len(running)} 个调度器运行中,共 {jobs} 个任务"
         if stopped:
             note += f";已停止: {', '.join(stopped)}"
-        return _item("system", "sys:scheduler", "调度器", "ok", 0, note=note)
+        return _item("system", "sys:scheduler", "调度器", "ok", 0, note=note,
+                     note_code="scheduler_running", note_params={"running": len(running), "jobs": jobs, "stopped": ", ".join(stopped)})
     return _item("system", "sys:scheduler", "调度器", "fail", 0,
                  error=f"调度器已停止: {', '.join(stopped)}")
 
@@ -249,7 +308,7 @@ def _identity(t: dict) -> dict:
     return {"category": t["category"], "key": t["key"], "name": t["name"], "group": t.get("group")}
 
 
-def _probe_for(t: dict, notify_send: bool):
+def _probe_for(t: dict, notify_send: bool, report_language: str):
     kind = t["_kind"]
     if kind == "db":
         return probe_db()
@@ -261,7 +320,9 @@ def _probe_for(t: dict, notify_send: bool):
         return probe_datasource(t["_obj"])
     if kind == "ai":
         return probe_ai_model(t["_obj"], t["_service"])
-    return probe_notify_channel(t["_obj"], send=notify_send)
+    return probe_notify_channel(
+        t["_obj"], send=notify_send, report_language=report_language
+    )
 
 
 def list_selfcheck_items(*, db=None, include_system: bool = True) -> list[dict]:
@@ -280,9 +341,15 @@ async def run_selfcheck(*, db=None, notify_send: bool = False, keys=None, includ
     own = db is None
     db = db or SessionLocal()
     try:
+        from src.platform.language import resolve_report_language
+
+        report_language = resolve_report_language(db)
         keyset = set(keys) if keys is not None else None
         targets = [t for t in _enumerate(db, include_system) if keyset is None or t["key"] in keyset]
-        tasks = [_guard(_probe_for(t, notify_send), _identity(t)) for t in targets]
+        tasks = [
+            _guard(_probe_for(t, notify_send, report_language), _identity(t))
+            for t in targets
+        ]
         items = list(await asyncio.gather(*tasks)) if tasks else []
         summary = {
             "total": len(items),

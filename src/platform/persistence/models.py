@@ -536,25 +536,6 @@ class MarketScanSnapshot(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
-class EntryCandidateFeedback(Base):
-    """入场候选反馈（用于策略迭代与质量评估）。"""
-
-    __tablename__ = "entry_candidate_feedback"
-    __table_args__ = (
-        Index("ix_entry_feedback_time", "created_at"),
-        Index("ix_entry_feedback_symbol_day", "stock_market", "stock_symbol", "snapshot_date"),
-        Index("ix_entry_feedback_source", "candidate_source"),
-    )
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    snapshot_date = Column(String, nullable=False, default="")  # YYYY-MM-DD
-    stock_symbol = Column(String, nullable=False)
-    stock_market = Column(String, nullable=False, default="CN")
-    candidate_source = Column(String, nullable=False, default="watchlist")
-    strategy_tags = Column(JSON, default=[])
-    useful = Column(Boolean, default=True)
-    reason = Column(String, default="")
-    created_at = Column(DateTime, server_default=func.now(), index=True)
 
 
 class EntryCandidateOutcome(Base):
@@ -921,20 +902,6 @@ class PortfolioRiskSnapshot(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
-class SuggestionFeedback(Base):
-    """建议反馈（匿名、轻量）"""
-
-    __tablename__ = "suggestion_feedback"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    suggestion_id = Column(
-        Integer,
-        ForeignKey("stock_suggestions.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    useful = Column(Boolean, default=True)
-    created_at = Column(DateTime, server_default=func.now(), index=True)
 
 
 class PriceAlertRule(Base):
@@ -1090,6 +1057,7 @@ class ChatConversation(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     title = Column(String, default="")
+    title_source = Column(String, nullable=False, default="provisional", server_default="legacy")
     stock_symbol = Column(String, nullable=True)
     stock_market = Column(String, nullable=True)
     ai_model_id = Column(Integer, nullable=True)
@@ -1140,6 +1108,35 @@ class AssistantContextSnapshot(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
+class AssistantContextExport(Base):
+    """Snapshot and resumable progress of a background Markdown export."""
+
+    __tablename__ = 'assistant_context_exports'
+    __table_args__ = (
+        UniqueConstraint('conversation_id', 'fingerprint', name='uq_assistant_export_source'),
+        Index('ix_assistant_export_status', 'status', 'created_at'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(Integer, ForeignKey('chat_conversations.id', ondelete='CASCADE'), nullable=False)
+    fingerprint = Column(String, nullable=False)
+    language = Column(String, nullable=False)
+    status = Column(String, nullable=False, default='queued')
+    source = Column(Text, nullable=False)
+    snapshot = Column(JSON, nullable=False)
+    context_budget = Column(Integer, nullable=False)
+    processed_chars = Column(Integer, nullable=False, default=0)
+    completed_parts = Column(Integer, nullable=False, default=0)
+    summary = Column(JSON, nullable=True)
+    result = Column(JSON, nullable=True)
+    error_code = Column(String, nullable=True)
+    lease_token = Column(String, nullable=False, default='')
+    attempt = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+
+
 class AssistantTaskRun(Base):
     """Durable execution snapshot for an interactive assistant request."""
 
@@ -1147,6 +1144,7 @@ class AssistantTaskRun(Base):
     __table_args__ = (
         Index("ix_assistant_task_run_conversation_created", "conversation_id", "created_at"),
         Index("ix_assistant_task_run_status_created", "status", "created_at"),
+        Index("ix_assistant_task_run_final_message", "final_message_id"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -1163,6 +1161,15 @@ class AssistantTaskRun(Base):
     cancel_requested = Column(Boolean, nullable=False, default=False)
     retry_count = Column(Integer, nullable=False, default=0)
     error_code = Column(String, nullable=True)
+    model = Column(String, nullable=True)
+    usage_source = Column(String, nullable=False, default="unknown")
+    input_tokens = Column(Integer, nullable=False, default=0)
+    output_tokens = Column(Integer, nullable=False, default=0)
+    total_tokens = Column(Integer, nullable=False, default=0)
+    cached_input_tokens = Column(Integer, nullable=False, default=0)
+    reasoning_output_tokens = Column(Integer, nullable=False, default=0)
+    result_schema_version = Column(Integer, nullable=False, default=1)
+    result_data = Column(JSON, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -1188,6 +1195,72 @@ class AssistantTaskEvent(Base):
     step_index = Column(Integer, nullable=True)
     data = Column(JSON, default={})
     occurred_at = Column(DateTime, server_default=func.now())
+
+
+class NotificationEvent(Base):
+    """Source event identity and minimal presentation data, shared by all inboxes."""
+
+    __tablename__ = "notification_events"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="ux_notification_event_dedupe"),
+        Index("ix_notification_event_source", "source", "id"),
+        Index("ix_notification_event_subject", "subject_kind", "subject_id"),
+        Index("ix_notification_event_group", "group_key", "resolved_at"),
+        {"sqlite_autoincrement": True},
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    schema_version = Column(Integer, nullable=False, default=1)
+    source = Column(String, nullable=False)
+    event_type = Column(String, nullable=False)
+    severity = Column(String, nullable=False, default="info")
+    attention = Column(String, nullable=False, default="informational")
+    dedupe_key = Column(String, nullable=False)
+    group_key = Column(String, nullable=False, default="")
+    subject_kind = Column(String, nullable=False)
+    subject_id = Column(String, nullable=False)
+    correlation_id = Column(String, nullable=False, default="")
+    template_key = Column(String, nullable=False)
+    template_params = Column(JSON, nullable=False, default=dict)
+    display_snapshot = Column(JSON, nullable=False, default=dict)
+    actions = Column(JSON, nullable=False, default=list)
+    toast_eligible = Column(Boolean, nullable=False, default=True)
+    occurred_at = Column(DateTime, nullable=False, server_default=func.now())
+    resolved_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+
+
+class NotificationReceipt(Base):
+    __tablename__ = "notification_receipts"
+    __table_args__ = (
+        UniqueConstraint("notification_id", "recipient_key", name="ux_notification_receipt_recipient"),
+        Index("ix_notification_receipt_inbox", "recipient_key", "archived_at", "read_at", "notification_id"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    notification_id = Column(Integer, ForeignKey("notification_events.id", ondelete="CASCADE"), nullable=False)
+    recipient_key = Column(String, nullable=False)
+    read_at = Column(DateTime, nullable=True)
+    archived_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class AssistantTaskNotification(Base):
+    """Transactional in-app attention records for durable assistant tasks."""
+
+    __tablename__ = "assistant_task_notifications"
+    __table_args__ = (
+        UniqueConstraint("task_run_id", "event_sequence", name="ux_assistant_notification_event"),
+        Index("ix_assistant_notification_inbox", "resolved_at", "read_at", "id"),
+        Index("ix_assistant_notification_task", "task_run_id"),
+        {"sqlite_autoincrement": True},
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_run_id = Column(Integer, nullable=False)
+    event_sequence = Column(Integer, nullable=False)
+    kind = Column(String, nullable=False)
+    read_at = Column(DateTime, nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
 
 
 class AssistantTaskStep(Base):
@@ -1221,6 +1294,11 @@ class AssistantToolInvocation(Base):
     status = Column(String, nullable=False, default="started")
     summary = Column(Text, nullable=False, default="")
     source_data = Column(JSON, default=[])
+    result_data = Column(JSON, default={})
+    observed_at = Column(DateTime, nullable=True)
+    duration_ms = Column(Integer, nullable=False, default=0)
+    attempt_count = Column(Integer, nullable=False, default=1)
+    error_code = Column(String, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     completed_at = Column(DateTime, nullable=True)
 

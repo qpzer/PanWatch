@@ -22,11 +22,14 @@ from pan_agent import (
     RuntimeEvent,
 )
 
+from src.platform.ai.errors import descriptor_for_code
 from src.platform.persistence.database import SessionLocal
 from src.platform.tasking.contracts import TaskEventType, TaskStatus
+from src.platform.language import resolve_report_language
 
 from .prompt import build_assistant_messages
 from .repository import AssistantRepository
+from .result_builder import build_assistant_result
 from .service import AssistantService
 
 logger = logging.getLogger(__name__)
@@ -43,6 +46,8 @@ _ERROR_MESSAGES = {
     "empty_answer": "助手暂时不可用，请稍后重试。",
     "transport_failed": "助手任务执行失败，请稍后重试。",
     "worker_cancelled": "助手任务已停止。",
+    "permission_denied": "当前助手权限不允许执行该操作，请在助手设置中调整后重试。",
+    "required_tool_call_missing": "未能生成可审批的操作，请重试。",
 }
 
 
@@ -53,17 +58,24 @@ class TaskCancelledError(RuntimeError):
 class DurableRuntimeEventSink:
     """Translate runtime facts into durable task events."""
 
-    def __init__(self, service: AssistantService, task_id: int, context_result=None) -> None:
+    def __init__(self, service: AssistantService, task_id: int, context_result=None, *, persist=None) -> None:
         self._service = service
         self._task_id = task_id
         self._context_result = context_result
         self._pending_answer_tokens: list[str] = []
         self._pending_answer_chars = 0
         self._last_answer_flush_at = time.monotonic()
+        self._persist = persist
+
+    async def _write(self, operation):
+        if self._persist is not None:
+            return await self._persist(operation)
+        # Compatibility for standalone sinks; the durable runner always supplies
+        # a worker that owns a fresh session for each completed transaction.
+        return await asyncio.to_thread(operation, self._service)
 
     async def publish(self, event: RuntimeEvent) -> None:
         data = dict(event.data)
-        repository = self._service._repository
         if event.type is EventType.ANSWER_TOKEN:
             token = str(data.get("token") or "")
             if token:
@@ -78,13 +90,17 @@ class DurableRuntimeEventSink:
             await asyncio.sleep(0)
             return
 
-        if self._service._repository.is_task_cancelled(self._task_id):
+        if await self._write(lambda service: service._repository.is_task_cancelled(self._task_id)):
             raise TaskCancelledError("task cancelled")
 
         await self.flush()
         if event.type is EventType.RUN_CREATED:
             return
-        if event.type is EventType.STEP_UPDATED:
+        await self._write(lambda service: self._persist_event(service, event.type, data))
+
+    def _persist_event(self, service, event_type, data):
+        repository = service._repository
+        if event_type is EventType.STEP_UPDATED:
             repository.append_task_event(
                 self._task_id,
                 TaskEventType.STEP_PROGRESS,
@@ -93,7 +109,7 @@ class DurableRuntimeEventSink:
                 data=data,
             )
             return
-        if event.type is EventType.EXTENSION_EVENT:
+        if event_type is EventType.EXTENSION_EVENT:
             repository.append_task_event(
                 self._task_id,
                 TaskEventType.EXTENSION_EVENT,
@@ -101,7 +117,8 @@ class DurableRuntimeEventSink:
                 data=data,
             )
             return
-        if event.type is EventType.MODEL_USAGE:
+        if event_type is EventType.MODEL_USAGE:
+            repository.record_model_usage(self._task_id, data)
             repository.append_task_event(
                 self._task_id,
                 TaskEventType.MODEL_USAGE,
@@ -109,32 +126,40 @@ class DurableRuntimeEventSink:
                 data=data,
             )
             return
-        if event.type is EventType.TOOL_STARTED:
-            self._service.record_tool_started(self._task_id, data)
+        if event_type is EventType.TOOL_STARTED:
+            service.record_tool_started(self._task_id, data)
             return
-        if event.type is EventType.TOOL_COMPLETED:
-            self._service.record_tool_completion(self._task_id, data)
+        if event_type is EventType.TOOL_COMPLETED:
+            service.record_tool_completion(self._task_id, data)
             return
-        if event.type is EventType.APPROVAL_REQUIRED:
+        if event_type is EventType.APPROVAL_REQUIRED:
             return
 
     async def flush(self, *, check_cancelled: bool = True) -> None:
         """Persist buffered answer text without reordering surrounding events."""
         if not self._pending_answer_tokens:
             return
-        if check_cancelled and self._service._repository.is_task_cancelled(self._task_id):
-            raise TaskCancelledError("task cancelled")
-
         text = "".join(self._pending_answer_tokens)
-        self._service._repository.append_task_event(
-            self._task_id,
-            TaskEventType.ANSWER_TOKEN,
-            status=TaskStatus.RUNNING,
-            data={"text": text},
-        )
-        self._pending_answer_tokens.clear()
-        self._pending_answer_chars = 0
-        self._last_answer_flush_at = time.monotonic()
+        count = len(self._pending_answer_tokens)
+        persisted = False
+        def persist(service):
+            nonlocal persisted
+            if check_cancelled and service._repository.is_task_cancelled(self._task_id):
+                raise TaskCancelledError("task cancelled")
+            service._repository.append_task_event(
+                self._task_id, TaskEventType.ANSWER_TOKEN,
+                status=TaskStatus.RUNNING, data={"text": text},
+            )
+            persisted = True
+        try:
+            await self._write(persist)
+        finally:
+            # Cancellation may arrive after the shielded write committed. Do
+            # not replay that batch during cancellation cleanup.
+            if persisted:
+                del self._pending_answer_tokens[:count]
+                self._pending_answer_chars -= len(text)
+                self._last_answer_flush_at = time.monotonic()
 
 
 class AssistantTaskRunner:
@@ -143,6 +168,43 @@ class AssistantTaskRunner:
     def __init__(self, session_factory: Callable = SessionLocal) -> None:
         self._session_factory = session_factory
         self._tasks: dict[int, asyncio.Task] = {}
+        self._title_tasks: dict[int, asyncio.Task] = {}
+
+    async def _write(self, operation):
+        def run():
+            with self._session_factory() as db:
+                return operation(AssistantService(AssistantRepository(db)))
+        # Finish the transaction before cancellation cleanup attempts another
+        # write. Cancelling to_thread alone cannot stop a SQLite lock wait.
+        pending = asyncio.create_task(asyncio.to_thread(run))
+        try:
+            return await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            await pending
+            raise
+
+    def _schedule_title(self, conversation_id: int) -> None:
+        if conversation_id in self._title_tasks:
+            return
+        worker = asyncio.create_task(self._generate_title(conversation_id))
+        self._title_tasks[conversation_id] = worker
+        worker.add_done_callback(lambda _: self._title_tasks.pop(conversation_id, None))
+
+    async def _generate_title(self, conversation_id: int) -> None:
+        db = self._session_factory()
+        try:
+            await asyncio.wait_for(
+                AssistantService(AssistantRepository(db)).generate_conversation_title(conversation_id, persist=self._write),
+                timeout=8,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A failed title summary must leave the completed answer intact.
+            db.rollback()
+            logger.info('Assistant title generation skipped: conversation_id=%s', conversation_id)
+        finally:
+            db.close()
 
     def start_message(self, task_id: int, conversation_id: int) -> None:
         self._start(
@@ -156,6 +218,10 @@ class AssistantTaskRunner:
             self._run_resume(task_id, conversation_id, checkpoint, decisions),
         )
 
+    def is_running(self, task_id: int) -> bool:
+        worker = self._tasks.get(task_id)
+        return worker is not None and not worker.done()
+
     def cancel(self, task_id: int) -> bool:
         worker = self._tasks.get(task_id)
         if worker is None or worker.done():
@@ -165,13 +231,20 @@ class AssistantTaskRunner:
 
     async def recover_pending(self) -> None:
         """Requeue safe queued work and fail stale in-flight work explicitly."""
+        queued = await asyncio.to_thread(self._recover_pending)
+        for task_id, conversation_id in queued:
+            self.start_message(task_id, conversation_id)
+
+    def _recover_pending(self):
+        queued = []
         db = self._session_factory()
         try:
             repository = AssistantRepository(db)
+            repository.restore_waiting_notifications()
             tasks = repository.list_tasks_for_recovery()
             for task in tasks:
                 if task.status == TaskStatus.QUEUED.value:
-                    self.start_message(task.id, task.conversation_id)
+                    queued.append((task.id, task.conversation_id))
                     continue
                 repository.finish_task(
                     task.id,
@@ -185,6 +258,8 @@ class AssistantTaskRunner:
                 )
         finally:
             db.close()
+
+        return queued
 
     def _start(self, task_id: int, coroutine) -> None:
         existing = self._tasks.get(task_id)
@@ -211,13 +286,14 @@ class AssistantTaskRunner:
         service = AssistantService(AssistantRepository(db))
         sink: DurableRuntimeEventSink | None = None
         try:
-            if not service._repository.claim_task(task_id):
+            if not await self._write(lambda worker: worker._repository.claim_task(task_id)):
                 return
             if service._repository.is_task_cancelled(task_id):
                 return
-            context_result = await service.prepare_context(conversation_id)
+            task_run = service._repository.get_task_run(task_id)
+            context_result = await service.prepare_context(conversation_id, persist=self._write)
             if context_result is not None:
-                service._repository.append_task_event(
+                await self._write(lambda worker: worker._repository.append_task_event(
                     task_id,
                     TaskEventType.CONTEXT_PREPARED,
                     status=TaskStatus.RUNNING,
@@ -229,8 +305,9 @@ class AssistantTaskRunner:
                         "usage_after": context_result.usage_after.model_dump(mode="json"),
                         "compressed_message_count": context_result.compressed_message_count,
                     },
-                )
-            runtime = service.build_runtime(service.build_failover_client())
+                ))
+            client = service.build_failover_client()
+            runtime = service.build_runtime(client)
             messages = (
                 context_result.messages
                 if context_result is not None
@@ -244,14 +321,17 @@ class AssistantTaskRunner:
             request = RunRequest(
                 run_id=str(task_id),
                 messages=messages,
-                context=(
-                    {
-                        "context_usage": context_result.usage_after.model_dump(mode="json"),
-                        "context_compressed": context_result.compressed,
-                    }
-                    if context_result is not None
-                    else {}
-                ),
+                context={
+                    **dict(task_run.context or {}),
+                    **(
+                        {
+                            "context_usage": context_result.usage_after.model_dump(mode="json"),
+                            "context_compressed": context_result.compressed,
+                        }
+                        if context_result is not None
+                        else {}
+                    ),
+                },
                 limits=RunLimits(
                     max_steps=ASSISTANT_MAX_STEPS,
                     max_tool_calls=ASSISTANT_MAX_TOOL_CALLS,
@@ -259,7 +339,7 @@ class AssistantTaskRunner:
                     tool_timeout_seconds=ASSISTANT_TOOL_TIMEOUT_SECONDS,
                 ),
             )
-            sink = DurableRuntimeEventSink(service, task_id, context_result)
+            sink = DurableRuntimeEventSink(service, task_id, context_result, persist=self._write)
             result = await asyncio.wait_for(
                 runtime.run(
                     request,
@@ -268,22 +348,28 @@ class AssistantTaskRunner:
                 timeout=ASSISTANT_RUN_TIMEOUT_SECONDS,
             )
             await sink.flush()
-            await self._finish_result(service, task_id, conversation_id, result)
+            await self._finish_result(
+                service,
+                task_id,
+                conversation_id,
+                result,
+                composer_client=client,
+            )
         except TaskCancelledError:
             await self._flush_sink(sink)
-            self._cancel_if_needed(service, task_id)
+            await self._write(lambda worker: self._cancel_if_needed(worker, task_id))
         except asyncio.TimeoutError:
             await self._flush_sink(sink)
-            self._fail(service, task_id, "run_timeout")
+            await self._write(lambda worker: self._fail(worker, task_id, "run_timeout"))
         except asyncio.CancelledError:
             await self._flush_sink(sink)
             if not service._repository.is_task_cancelled(task_id):
-                self._fail(service, task_id, "worker_cancelled")
+                await self._write(lambda worker: self._fail(worker, task_id, "worker_cancelled"))
             raise
         except Exception:
             await self._flush_sink(sink)
             logger.exception("Assistant task failed: task_id=%s", task_id)
-            self._fail(service, task_id, "transport_failed")
+            await self._write(lambda worker: self._fail(worker, task_id, "transport_failed"))
         finally:
             db.close()
 
@@ -294,11 +380,12 @@ class AssistantTaskRunner:
         service = AssistantService(AssistantRepository(db))
         sink: DurableRuntimeEventSink | None = None
         try:
-            if not service._repository.claim_task(task_id):
+            if not await self._write(lambda worker: worker._repository.claim_task(task_id)):
                 return
             if service._repository.is_task_cancelled(task_id):
                 return
-            runtime = service.build_runtime(service.build_failover_client())
+            client = service.build_failover_client()
+            runtime = service.build_runtime(client)
             request = RunRequest(
                 run_id=str(task_id),
                 messages=checkpoint.messages,
@@ -309,7 +396,7 @@ class AssistantTaskRunner:
                     tool_timeout_seconds=ASSISTANT_TOOL_TIMEOUT_SECONDS,
                 ),
             )
-            sink = DurableRuntimeEventSink(service, task_id)
+            sink = DurableRuntimeEventSink(service, task_id, persist=self._write)
             result = await asyncio.wait_for(
                 runtime.resume(
                     request,
@@ -320,59 +407,112 @@ class AssistantTaskRunner:
                 timeout=ASSISTANT_RUN_TIMEOUT_SECONDS,
             )
             await sink.flush()
-            await self._finish_result(service, task_id, conversation_id, result)
+            await self._finish_result(
+                service,
+                task_id,
+                conversation_id,
+                result,
+                composer_client=client,
+            )
         except TaskCancelledError:
             await self._flush_sink(sink)
-            self._cancel_if_needed(service, task_id)
+            await self._write(lambda worker: self._cancel_if_needed(worker, task_id))
         except asyncio.TimeoutError:
             await self._flush_sink(sink)
-            self._fail(service, task_id, "run_timeout")
+            await self._write(lambda worker: self._fail(worker, task_id, "run_timeout"))
         except asyncio.CancelledError:
             await self._flush_sink(sink)
             if not service._repository.is_task_cancelled(task_id):
-                self._fail(service, task_id, "worker_cancelled")
+                await self._write(lambda worker: self._fail(worker, task_id, "worker_cancelled"))
             raise
         except Exception:
             await self._flush_sink(sink)
             logger.exception("Assistant approval resume failed: task_id=%s", task_id)
-            self._fail(service, task_id, "transport_failed")
+            await self._write(lambda worker: self._fail(worker, task_id, "transport_failed"))
         finally:
             db.close()
 
     async def _finish_result(
-        self, service: AssistantService, task_id: int, conversation_id: int, result: RunResult
+        self,
+        service: AssistantService,
+        task_id: int,
+        conversation_id: int,
+        result: RunResult,
+        *,
+        composer_client=None,
     ) -> None:
         if result.status is RunStatus.WAITING_FOR_APPROVAL:
-            approvals = service.pause_task(task_id, result)
-            for approval in approvals:
-                service._repository.append_task_event(
+            def pause(worker):
+                approvals = worker.pause_task(task_id, result)
+                for approval in approvals:
+                    worker._repository.append_task_event(
+                        task_id,
+                        TaskEventType.APPROVAL_REQUIRED,
+                        status=TaskStatus.WAITING_APPROVAL,
+                        data={
+                            "approval_id": approval.id,
+                            "call_id": approval.call_id,
+                            "name": approval.tool_name,
+                            "risk": approval.risk,
+                            "arguments": approval.arguments or {},
+                            "expires_at": approval.expires_at.isoformat()
+                            if approval.expires_at
+                            else "",
+                        },
+                    )
+                worker._repository.append_task_event(
                     task_id,
-                    TaskEventType.APPROVAL_REQUIRED,
+                    TaskEventType.TASK_PAUSED,
                     status=TaskStatus.WAITING_APPROVAL,
-                    data={
-                        "approval_id": approval.id,
-                        "call_id": approval.call_id,
-                        "name": approval.tool_name,
-                        "risk": approval.risk,
-                        "arguments": approval.arguments or {},
-                        "expires_at": approval.expires_at.isoformat()
-                        if approval.expires_at
-                        else "",
-                    },
+                    data={"reason": "approval_required"},
                 )
-            service._repository.append_task_event(
-                task_id,
-                TaskEventType.TASK_PAUSED,
-                status=TaskStatus.WAITING_APPROVAL,
-                data={"reason": "approval_required"},
-            )
+            await self._write(pause)
             return
         if result.status is not RunStatus.COMPLETED or not result.answer.strip():
-            self._fail(service, task_id, result.error_code or "empty_answer")
+            await self._write(lambda worker: self._fail(worker, task_id, result.error_code or "empty_answer"))
             return
-        service.complete_task_with_message(task_id, conversation_id, result.answer)
+        tokens_before = int(getattr(composer_client, "total_tokens_used", 0) or 0)
+        structured_result = await build_assistant_result(
+            task_id=task_id,
+            answer=result.answer,
+            invocations=await self._write(lambda worker: worker._repository.list_task_tool_invocations(task_id)),
+            language=await self._write(lambda worker: resolve_report_language(worker._repository.session)),
+            client=composer_client,
+        )
+        tokens_after = int(getattr(composer_client, "total_tokens_used", 0) or 0)
+        composer_usage = getattr(composer_client, "last_usage", None)
+        if tokens_after > tokens_before and composer_usage is not None:
+            usage_data = (
+                composer_usage.model_dump(mode="json")
+                if hasattr(composer_usage, "model_dump")
+                else dict(composer_usage)
+            )
+            usage_data["phase"] = "result_composition"
+            def record_usage(worker):
+                worker._repository.record_model_usage(task_id, usage_data)
+                worker._repository.append_task_event(
+                    task_id,
+                    TaskEventType.MODEL_USAGE,
+                    status=TaskStatus.RUNNING,
+                    data=usage_data,
+                )
+            await self._write(record_usage)
+        completed = await self._write(lambda worker: worker._repository.complete_task_with_message(
+            task_id,
+            conversation_id,
+            result.answer,
+            result_data=structured_result.model_dump(mode="json"),
+        ))
+        if completed is not None:
+            self._schedule_title(conversation_id)
 
     def _fail(self, service: AssistantService, task_id: int, error_code: str) -> None:
+        descriptor = descriptor_for_code(error_code)
+        message = (
+            descriptor.message
+            if error_code.startswith("ai_")
+            else _ERROR_MESSAGES.get(error_code, _ERROR_MESSAGES["transport_failed"])
+        )
         service._repository.finish_task(
             task_id,
             status=TaskStatus.FAILED.value,
@@ -380,7 +520,8 @@ class AssistantTaskRunner:
             error_code=error_code,
             event_data={
                 "code": error_code,
-                "message": _ERROR_MESSAGES.get(error_code, _ERROR_MESSAGES["transport_failed"]),
+                "message": message,
+                "retryable": descriptor.retryable if error_code.startswith("ai_") else True,
             },
         )
 

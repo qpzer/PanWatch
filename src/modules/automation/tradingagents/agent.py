@@ -4,7 +4,7 @@
 1. collect() 走 PanWatch Provider Orchestrator,4 类数据并发拉
 2. analyze() 重写,不走单次 ai_client.chat,而是调 TradingAgentsGraph
 3. monkeypatch route_to_vendor 让 TradingAgents 拿到 PanWatch 数据(A 股专用)
-4. progress callback + cost tracker + 月度预算 + 同日缓存
+4. progress callbacks + provider Token usage + 同日缓存
 """
 
 from __future__ import annotations
@@ -18,8 +18,6 @@ from typing import Any
 
 from src.modules.automation.base import AgentContext, AnalysisResult, BaseAgent
 from src.modules.automation.tradingagents.observability import (
-    check_budget,
-    estimate_cost,
     get_today_cache_key,
 )
 from src.modules.automation.tradingagents.runtime_support import (
@@ -83,14 +81,14 @@ def _bounded_graph_class(graph_cls):
 class TradingAgentsAgent(BaseAgent):
     name = "tradingagents"
     display_name = "TradingAgents 深度分析"
-    description = "多 Agent 投资决策框架,3-5 分钟,~$0.05/次 (deepseek-chat)"
+    description = "多 Agent 投资决策框架，支持分析师、辩论、风控与 PM 决策"
 
     def __init__(
         self,
         analyst_types: list[str] | None = None,
         debate_rounds: int = 1,
-        monthly_budget_usd: float = 10.0,
-        over_budget_action: str = "reject",  # reject / warn / continue
+        monthly_budget_usd: float | None = None,  # ignored legacy configuration
+        over_budget_action: str | None = None,   # ignored legacy configuration
         cache_ttl_hours: int = 12,
         output_language: str = "Chinese",
         deep_model: str | None = None,    # 推理/辩论/PM 用的强模型 (留空走默认)
@@ -115,8 +113,8 @@ class TradingAgentsAgent(BaseAgent):
 
         self.analyst_types = analysts
         self.debate_rounds = max(1, int(debate_rounds))
-        self.monthly_budget_usd = float(monthly_budget_usd)
-        self.over_budget_action = over_budget_action
+        # Legacy budget options are accepted but ignored so existing settings
+        # do not discard model, timeout or debate configuration on upgrade.
         self.cache_ttl_hours = max(0, int(cache_ttl_hours))
         self.output_language = output_language
         self.deep_model = (deep_model or "").strip() or None
@@ -284,7 +282,7 @@ class TradingAgentsAgent(BaseAgent):
 
         # 0) 同日缓存命中(force_refresh=True 时跳过)
         if not force_refresh:
-            cached = self._try_cache_hit(stock)
+            cached = self._try_cache_hit(stock, context.report_language)
             if cached is not None:
                 logger.info(
                     f"[TA] 命中同日缓存 (agent=tradingagents symbol={stock.symbol})"
@@ -292,29 +290,15 @@ class TradingAgentsAgent(BaseAgent):
                 cached.raw_data["from_cache"] = True
                 return cached
 
-        # 1) 预算检查
-        budget = check_budget(self.monthly_budget_usd, self.name)
-        if budget["exceeded"]:
-            if self.over_budget_action == "reject":
-                raise RuntimeError(
-                    f"本月 TradingAgents 预算已用尽 "
-                    f"(${budget['used']:.2f} / ${self.monthly_budget_usd:.2f})。"
-                    f"如需继续使用,请在「设置」中调高预算上限。"
-                )
-            elif self.over_budget_action == "warn":
-                logger.warning(
-                    f"[TA] 预算已超,但策略=warn,继续执行 "
-                    f"(${budget['used']:.2f} / ${self.monthly_budget_usd:.2f})"
-                )
-
         # 2) 构造 TradingAgents config (支持 deep / quick 双模型)
         from src.platform.persistence.database import DB_PATH
+        output_language = "English" if context.report_language == "en-US" else "Chinese"
         ta_runtime_dir = Path(DB_PATH).resolve().parent / "tradingagents"
         ta_config = build_ta_llm_config(
             context.ai_client,
             debate_rounds=self.debate_rounds,
             selected_analysts=self.analyst_types,
-            output_language=self.output_language,
+            output_language=output_language,
             deep_model=self.deep_model,
             quick_model=self.quick_model,
             market=stock.market.value,
@@ -365,15 +349,15 @@ class TradingAgentsAgent(BaseAgent):
         except asyncio.TimeoutError:
             cancel_event.set()
             # 超时:尝试落库部分进度供后续查看
-            partial_cost = getattr(progress_handler, "_total_cost", 0.0)
+            partial_usage = progress_handler.token_usage
             partial_stages = list(getattr(progress_handler, "_completed_stages", set()))
             logger.warning(
                 f"[TA] 执行超时 (>{self.timeout_minutes} 分钟). "
-                f"已完成阶段: {partial_stages}, 累计成本 ${partial_cost:.4f}"
+                f"已完成阶段: {partial_stages}, 已记录 Token {partial_usage['total_tokens']}"
             )
             partial_msg = (
                 f"分析超时(>{self.timeout_minutes} 分钟)。"
-                f"已完成 {len(partial_stages)} 个阶段,累计成本 ${partial_cost:.4f}。"
+                f"已完成 {len(partial_stages)} 个阶段。"
                 f"建议:① 缩短 debate_rounds;② 换更快的模型(如 deepseek-chat);"
                 f"③ 调高 timeout_minutes。"
             )
@@ -390,6 +374,7 @@ class TradingAgentsAgent(BaseAgent):
             stock=stock,
             ta_result=ta_result,
             model_label=context.model_label,
+            output_language=output_language,
         )
 
         # 存分析时实时价 → 历史决策表"分析价"立即显示(不必等当日 K线收盘回填)
@@ -408,7 +393,7 @@ class TradingAgentsAgent(BaseAgent):
             logger.warning(f"[TA] 收集 toolkit 诊断失败,忽略: {e}")
 
         # 6) 落库到 AnalysisHistory:供 UI 查最近一次结果 (DeepAnalysisModal 弹窗) +
-        # 月度成本预算聚合。同标的同日复跑会覆盖 (analysis_history.save_analysis 语义)。
+        # 同标的同日复跑会覆盖 (analysis_history.save_analysis 语义)。
         try:
             save_analysis(
                 agent_name=self.name,
@@ -421,7 +406,7 @@ class TradingAgentsAgent(BaseAgent):
             logger.warning(f"[TA] save_analysis 失败,不影响主流程: {e}")
 
         # 6b) 落库到 StockSuggestion(建议池) — 让持仓页/关注列表上的建议徽章
-        # 显示 TradingAgents 的 BUY/HOLD/SELL 决策(跟「盘前分析」「收盘复盘」并列)。
+        # 显示 TradingAgents 的七类方向建议和复核状态(跟「盘前分析」「收盘复盘」并列)。
         try:
             from src.modules.automation.suggestion_pool import save_suggestion
 
@@ -431,16 +416,14 @@ class TradingAgentsAgent(BaseAgent):
             signal_text = (sug.get("signal") or "")[:500]
             reason_text = (sug.get("reason") or "")[:1000]
             confidence = sug.get("confidence")
-            confidence_text = (
-                f" (置信度 {confidence:.1f}/10)" if isinstance(confidence, (int, float)) else ""
-            )
 
             save_suggestion(
                 stock_symbol=stock.symbol,
                 stock_name=stock.name,
                 stock_market=stock.market.value,
                 action=action,
-                action_label=f"{action_label}{confidence_text}",
+                suggestion_state=sug,
+                action_label=action_label,
                 agent_name=self.name,
                 agent_label="TradingAgents 深度",
                 signal=signal_text,
@@ -502,7 +485,7 @@ class TradingAgentsAgent(BaseAgent):
     def _make_trace_id(self, symbol: str) -> str:
         return f"ta-{symbol}-{int(datetime.now().timestamp())}"
 
-    def _try_cache_hit(self, stock) -> AnalysisResult | None:
+    def _try_cache_hit(self, stock, report_language: str = "zh-CN") -> AnalysisResult | None:
         """同标的同日是否已分析过 → 返回缓存的 AnalysisResult。"""
         if self.cache_ttl_hours <= 0:
             return None
@@ -518,7 +501,11 @@ class TradingAgentsAgent(BaseAgent):
             return None
         return AnalysisResult(
             agent_name=self.name,
-            title=history.title or f"【深度·缓存】{stock.name}({stock.symbol})",
+            title=history.title or (
+                f"[Deep analysis · cached] {stock.name} ({stock.symbol})"
+                if report_language == "en-US"
+                else f"【深度·缓存】{stock.name}({stock.symbol})"
+            ),
             content=history.content,
             raw_data=dict(history.raw_data),
         )
@@ -583,15 +570,15 @@ class TradingAgentsAgent(BaseAgent):
                 portfolio=to_tradingagents_portfolio(portfolio),
             )
 
-        # 成本提取(TradingAgents 内部 token 统计;若上游未暴露,fallback 用 estimate)
-        cost_usd = self._extract_cost_from_graph(graph) or self._fallback_cost_estimate(
-            ta_config
-        )
+        # Keep upstream cost metadata for legacy consumers, without fabricating
+        # a charge from assumed tokens/model prices. The UI shows provider usage.
+        cost_usd = self._extract_cost_from_graph(graph)
 
         return {
             "decision": str(decision or "HOLD").upper(),
             "final_state": dict(final_state) if final_state else {},
             "cost_usd": float(cost_usd or 0.0),
+            "token_usage": progress_handler.token_usage if progress_handler else None,
         }
 
     @staticmethod
@@ -662,12 +649,3 @@ class TradingAgentsAgent(BaseAgent):
                 except (TypeError, ValueError):
                     continue
         return 0.0
-
-    def _fallback_cost_estimate(self, ta_config: dict) -> float:
-        """fallback 用 estimate 平均值。"""
-        est = estimate_cost(
-            debate_rounds=ta_config.get("max_debate_rounds", 1),
-            selected_analysts=ta_config.get("selected_analysts", []),
-            model=ta_config.get("deep_think_llm", "deepseek-chat"),
-        )
-        return (est["cost_low_usd"] + est["cost_high_usd"]) / 2

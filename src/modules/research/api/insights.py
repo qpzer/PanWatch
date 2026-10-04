@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from typing import List
 
@@ -8,7 +8,7 @@ from src.platform.marketdata.models import MarketCode
 from src.platform.marketdata.marketdata_client import md_quote_rows
 from src.platform.marketdata.collectors.kline_collector import KlineCollector
 from src.modules.automation.suggestion_pool import get_latest_suggestions
-from src.modules.assistant.legacy_chat_tools import (
+from src.modules.assistant.tool_adapters import (
     build_stock_context,
     fetch_realtime_context,
     fetch_technical_context,
@@ -17,6 +17,7 @@ from src.platform.ai.ai_failover import get_configured_failover_client
 from src.platform.marketdata.collectors.market_http import TTLCache
 from src.platform.persistence.database import get_db
 from src.platform.persistence.models import Stock
+from src.web.errors import ai_api_error, api_error
 import asyncio
 import logging
 import time
@@ -42,7 +43,7 @@ def _parse_market(market: str) -> MarketCode:
     try:
         return MarketCode(market)
     except ValueError:
-        raise HTTPException(400, f"不支持的市场: {market}")
+        raise api_error(400, "market_unsupported", f"不支持的市场: {market}")
 
 
 @router.post("/batch")
@@ -142,11 +143,11 @@ def _parse_verdict(text: str) -> str:
     return "未知"
 
 
-async def _fetch_fundamental_context(symbol: str, market: str) -> str:
+async def _fetch_fundamental_context(symbol: str, market: str, *, quotes=None) -> str:
     """基本面摘要:PE / 换手率 / 市值 / 今日振幅(取自实时行情,失败返回空)。"""
     try:
         mc = MarketCode(market) if market in ("CN", "HK", "US") else MarketCode.CN
-        rows = await asyncio.to_thread(md_quote_rows, [symbol], mc.value)
+        rows = quotes if quotes is not None else await asyncio.to_thread(md_quote_rows, [symbol], mc.value)
         if not rows:
             return ""
         q = rows[0]
@@ -208,7 +209,7 @@ async def add_position_eval(req: AddPositionEvalRequest, db: Session = Depends(g
     add_q = float(req.add_quantity)
     add_p = float(req.add_price)
     if add_q <= 0 or add_p <= 0:
-        raise HTTPException(400, "加仓股数与价格必须大于 0")
+        raise api_error(400, "position_calculation_invalid", "加仓股数与价格必须大于 0")
 
     new_q = cur_q + add_q
     new_cost = (cur_q * cur_c + add_q * add_p) / new_q if new_q > 0 else add_p
@@ -218,10 +219,20 @@ async def add_position_eval(req: AddPositionEvalRequest, db: Session = Depends(g
     action = "加仓" if is_add else "建仓"
 
     # 上下文:实时行情 + 基本面 + 技术面 + 消息面(新闻/公告/本地观点)
-    realtime = await fetch_realtime_context(req.symbol, market)
-    fundamental = await _fetch_fundamental_context(req.symbol, market)
-    technical = await fetch_technical_context(req.symbol, market)
-    message = await _fetch_message_context(db, req.symbol, market)
+    async def quote_contexts():
+        try:
+            rows = await asyncio.to_thread(md_quote_rows, [req.symbol], market)
+        except Exception:
+            rows = []
+        return await asyncio.gather(
+            fetch_realtime_context(req.symbol, market, quotes=rows),
+            _fetch_fundamental_context(req.symbol, market, quotes=rows),
+        )
+    (realtime, fundamental), technical, message = await asyncio.gather(
+        quote_contexts(),
+        fetch_technical_context(req.symbol, market),
+        _fetch_message_context(db, req.symbol, market),
+    )
 
     holding_line = (
         f"当前持仓 {cur_q:.0f} 股,成本(单价) {cur_c:.3f}"
@@ -252,8 +263,9 @@ async def add_position_eval(req: AddPositionEvalRequest, db: Session = Depends(g
     try:
         client = get_configured_failover_client(db, req.model_id)
         content = await client.chat(system_prompt, user_content, temperature=0.3)
-    except Exception as e:
-        raise HTTPException(502, f"AI 评估失败: {e}")
+    except Exception as exc:
+        logger.warning("AI 加仓评估失败: %s", exc)
+        raise ai_api_error(exc) from exc
 
     return {
         "symbol": req.symbol,
@@ -341,8 +353,9 @@ async def announcement_eval(req: AnnouncementEvalRequest, db: Session = Depends(
         content = await get_configured_failover_client(db, req.model_id).chat(
             system_prompt, user_content, temperature=0.2
         )
-    except Exception as e:
-        raise HTTPException(502, f"AI 公告解读失败: {e}")
+    except Exception as exc:
+        logger.warning("AI 公告解读失败: %s", exc)
+        raise ai_api_error(exc) from exc
 
     tone_map: dict[int, tuple[str, str]] = {}
     for line in (content or "").splitlines():
