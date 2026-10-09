@@ -60,6 +60,9 @@ SUGGESTION_TYPES = {
     "观望": "watch",  # 暂不操作
 }
 
+# 仅买卖动作推送盘中通知; 观望/持有的关注提醒(attention/review)只入建议池和分析历史
+NOTIFY_ACTIONS = {"buy", "add", "reduce", "sell"}
+
 PROMPT_PATH = Path(__file__).parent.parent.parent.parent / "prompts" / "intraday_monitor.txt"
 
 
@@ -70,7 +73,9 @@ class IntradayMonitorAgent(BaseAgent):
     特点：
     - 单只模式 (single): 逐只股票分析，每只单独发送通知
     - AI 智能判断: 把股票数据发给 AI，由 AI 决定是否值得提醒
-    - 通知节流: 同一股票同一动作短时间内不重复通知,动作变化(如 持有→减仓)立即通知
+    - 通知门槛: 仅买卖动作(建仓/加仓/减仓/清仓)推送通知,观望/持有的关注提醒只入建议池
+    - 动作防抖: 动作翻转后首轮静默,同一动作在防抖窗口内连续出现才通知
+    - 通知节流: 同一股票同一动作短时间内不重复通知,动作变化(如 持有→减仓)换键放行
     - 技术分析: 包含 K 线和技术指标
     """
 
@@ -81,6 +86,7 @@ class IntradayMonitorAgent(BaseAgent):
     def __init__(
         self,
         throttle_minutes: int = 30,
+        debounce_minutes: int = 15,
         bypass_throttle: bool = False,
         bypass_market_hours: bool = False,
         event_only: bool = True,
@@ -92,7 +98,8 @@ class IntradayMonitorAgent(BaseAgent):
         """
         Args:
             throttle_minutes: 同一股票通知间隔（分钟）
-            bypass_throttle: 是否跳过节流（测试用）
+            debounce_minutes: 动作防抖窗口（分钟），同一动作需在窗口内连续出现才通知
+            bypass_throttle: 是否跳过节流与防抖（测试用）
             bypass_market_hours: 是否跳过交易时段门禁（仅手动分析场景）
             price_alert_threshold: 涨跌幅超过阈值视为价格异动（%）
             volume_alert_ratio: 量比超过阈值视为放量异动
@@ -100,6 +107,7 @@ class IntradayMonitorAgent(BaseAgent):
             take_profit_warning: 浮盈超过阈值触发止盈提醒（%）
         """
         self.throttle_minutes = throttle_minutes
+        self.debounce_minutes = debounce_minutes
         self.bypass_throttle = bypass_throttle
         self.bypass_market_hours = bypass_market_hours
         self.event_only = event_only
@@ -956,12 +964,25 @@ class IntradayMonitorAgent(BaseAgent):
         if not symbol:
             return False
 
-        # 检查节流（测试模式可跳过）。节流键含动作:动作升级(如 持有→减仓/卖出)
-        # 不被上一轮通知的窗口吞掉,同一动作在窗口期内仍不重复通知。
+        # 仅买卖动作推送通知; 观望/持有即使带关注标记(attention/review)也不推送,
+        # 只在建议池和分析历史中可见。
+        suggestion = result.raw_data.get("suggestion") or {}
+        action = str(suggestion.get("action") or "").strip().lower()
+        if action not in NOTIFY_ACTIONS:
+            logger.info(f"非买卖动作不通知: {symbol} (action={action or 'unknown'})")
+            return False
+
+        # 防抖与节流（测试模式可跳过）。
+        # 防抖: 动作翻转后首轮静默,同一动作在防抖窗口内连续出现才放行,抑制 AI 横跳;
+        # 节流键含动作:动作升级(如 持有→减仓/卖出)换键,不被上一轮通知的窗口吞掉,
+        # 同一动作在窗口期内仍不重复通知。
         if not self.bypass_throttle:
-            throttle_key = self._throttle_key(
-                symbol, result.raw_data.get("suggestion")
-            )
+            if not self._check_action_stable(symbol, action):
+                logger.info(
+                    f"动作防抖: {symbol} action={action} 在 {self.debounce_minutes} 分钟内首次出现,暂不通知"
+                )
+                return False
+            throttle_key = self._throttle_key(symbol, suggestion)
             if not self._check_throttle(throttle_key):
                 logger.info(
                     f"通知节流: {throttle_key} 在 {self.throttle_minutes} 分钟内已通知"
@@ -982,6 +1003,54 @@ class IntradayMonitorAgent(BaseAgent):
         """
         action = ((suggestion or {}).get("action") or "").strip()
         return f"{symbol}:{action}" if action else symbol
+
+    def _check_action_stable(self, symbol: str, action: str) -> bool:
+        """动作防抖: 同一动作在 debounce_minutes 窗口内已出现过才返回 True。
+
+        每次调用都刷新该动作(键 "debounce:{symbol}:{action}")的最近出现时间,
+        与通知节流记录互不干扰: 动作翻转后首轮必然静默,下一轮动作不变即放行。
+        状态读写异常时放行,避免防抖故障吞掉真实信号。
+        """
+        from src.platform.persistence.database import SessionLocal
+        from src.platform.persistence.models import NotifyThrottle
+
+        key = f"debounce:{symbol}:{action}"
+        db = SessionLocal()
+        try:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            record = (
+                db.query(NotifyThrottle)
+                .filter(
+                    NotifyThrottle.agent_name == self.name,
+                    NotifyThrottle.stock_symbol == key,
+                )
+                .first()
+            )
+            stable = False
+            if record and record.last_notify_at:
+                last = record.last_notify_at
+                if last.tzinfo is not None:
+                    last = last.astimezone(timezone.utc).replace(tzinfo=None)
+                stable = last >= now - timedelta(minutes=self.debounce_minutes)
+            if record:
+                record.last_notify_at = now
+            else:
+                db.add(
+                    NotifyThrottle(
+                        agent_name=self.name,
+                        stock_symbol=key,
+                        last_notify_at=now,
+                        notify_count=0,
+                    )
+                )
+            db.commit()
+            return stable
+        except Exception:
+            db.rollback()
+            logger.exception(f"动作防抖状态异常,放行通知: {key}")
+            return True
+        finally:
+            db.close()
 
     def _check_throttle(self, throttle_key: str) -> bool:
         """检查是否可以发送通知（未被节流）。throttle_key 由 _throttle_key 生成。"""
