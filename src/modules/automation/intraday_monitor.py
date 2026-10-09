@@ -70,7 +70,7 @@ class IntradayMonitorAgent(BaseAgent):
     特点：
     - 单只模式 (single): 逐只股票分析，每只单独发送通知
     - AI 智能判断: 把股票数据发给 AI，由 AI 决定是否值得提醒
-    - 通知节流: 同一股票短时间内不重复通知
+    - 通知节流: 同一股票同一动作短时间内不重复通知,动作变化(如 持有→减仓)立即通知
     - 技术分析: 包含 K 线和技术指标
     """
 
@@ -956,11 +956,15 @@ class IntradayMonitorAgent(BaseAgent):
         if not symbol:
             return False
 
-        # 检查节流（测试模式可跳过）
+        # 检查节流（测试模式可跳过）。节流键含动作:动作升级(如 持有→减仓/卖出)
+        # 不被上一轮通知的窗口吞掉,同一动作在窗口期内仍不重复通知。
         if not self.bypass_throttle:
-            if not self._check_throttle(symbol):
+            throttle_key = self._throttle_key(
+                symbol, result.raw_data.get("suggestion")
+            )
+            if not self._check_throttle(throttle_key):
                 logger.info(
-                    f"通知节流: {symbol} 在 {self.throttle_minutes} 分钟内已通知"
+                    f"通知节流: {throttle_key} 在 {self.throttle_minutes} 分钟内已通知"
                 )
                 return False
         else:
@@ -968,8 +972,19 @@ class IntradayMonitorAgent(BaseAgent):
 
         return True
 
-    def _check_throttle(self, symbol: str) -> bool:
-        """检查是否可以发送通知（未被节流）"""
+    @staticmethod
+    def _throttle_key(symbol: str, suggestion: dict | None) -> str:
+        """节流键 = 股票 + 动作(如 "516310:reduce")。
+
+        同一动作在窗口期内不重复通知;动作变化即换键、立即通知,
+        避免 持有→减仓/卖出 这类升级信号被上一动作的窗口吞掉。
+        无动作时退化为裸 symbol(兼容旧行为)。
+        """
+        action = ((suggestion or {}).get("action") or "").strip()
+        return f"{symbol}:{action}" if action else symbol
+
+    def _check_throttle(self, throttle_key: str) -> bool:
+        """检查是否可以发送通知（未被节流）。throttle_key 由 _throttle_key 生成。"""
         from src.platform.persistence.database import SessionLocal
         from src.platform.persistence.models import NotifyThrottle
 
@@ -979,7 +994,7 @@ class IntradayMonitorAgent(BaseAgent):
                 db.query(NotifyThrottle)
                 .filter(
                     NotifyThrottle.agent_name == self.name,
-                    NotifyThrottle.stock_symbol == symbol,
+                    NotifyThrottle.stock_symbol == throttle_key,
                 )
                 .first()
             )
@@ -997,8 +1012,8 @@ class IntradayMonitorAgent(BaseAgent):
         finally:
             db.close()
 
-    def _update_throttle(self, symbol: str):
-        """更新节流记录"""
+    def _update_throttle(self, throttle_key: str):
+        """更新节流记录。throttle_key 由 _throttle_key 生成。"""
         from src.platform.persistence.database import SessionLocal
         from src.platform.persistence.models import NotifyThrottle
 
@@ -1008,7 +1023,7 @@ class IntradayMonitorAgent(BaseAgent):
                 db.query(NotifyThrottle)
                 .filter(
                     NotifyThrottle.agent_name == self.name,
-                    NotifyThrottle.stock_symbol == symbol,
+                    NotifyThrottle.stock_symbol == throttle_key,
                 )
                 .first()
             )
@@ -1025,7 +1040,7 @@ class IntradayMonitorAgent(BaseAgent):
                 db.add(
                     NotifyThrottle(
                         agent_name=self.name,
-                        stock_symbol=symbol,
+                        stock_symbol=throttle_key,
                         last_notify_at=now,
                         notify_count=1,
                     )
@@ -1100,7 +1115,10 @@ class IntradayMonitorAgent(BaseAgent):
                         f"Agent [{self.display_name}] 通知已发送: {stock_symbol}"
                     )
                     if not self.bypass_throttle:
-                        await asyncio.to_thread(self._update_throttle, stock_symbol)
+                        throttle_key = self._throttle_key(
+                            stock_symbol, result.raw_data.get("suggestion")
+                        )
+                        await asyncio.to_thread(self._update_throttle, throttle_key)
                 else:
                     notify_error = notify_result.get("error") or "未知错误"
                     result.raw_data["notify_error"] = notify_error
