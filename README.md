@@ -70,12 +70,17 @@ The screenshots below use the English interface; Simplified Chinese is available
 | **Notifications** | Deliver reports and alerts through Telegram, WeCom, DingTalk, Feishu, Bark, or webhooks. |
 | **Mobile** | Install the PWA on your home screen and use the same workspace on your phone. |
 
+Stock and listed ETF search, watchlists, holdings, price alerts, quotes and candlesticks share the same workflow across mainland China, Hong Kong and US markets. Search by code or name (for example, `510300`, `159915`, `02800` or `SPY`). The asset type is saved with each instrument; select **ETF** for funds whose provider name does not identify them as ETFs.
+
+ETF deep analysis uses fund-specific context and does not substitute company financial statements. Fund holdings, NAV, fees and tracking error are not yet supplied as structured data. Paper trading continues to use its existing market rules and cost model; ETF-specific T+0 exceptions and fee schedules are not modeled.
+
 ## Quick Start
 
 ```bash
 docker run -d \
   --name panwatch \
   --restart unless-stopped \
+  -e TZ=Asia/Shanghai \
   -p 8000:8000 \
   -v panwatch_data:/app/data \
   sunxiao0721/panwatch:latest
@@ -83,13 +88,19 @@ docker run -d \
 
 Open `http://localhost:8000` and create your login credentials.
 
+Set `TZ` explicitly for background schedules and notification quiet hours, for example
+`-e TZ=UTC` or `-e TZ=America/New_York`. The image defaults to `Asia/Shanghai` and does
+not detect the host timezone. Interface timestamps and alert expiry inputs use the
+browser timezone. [Timezone policy](docs/timezones.md)
+
 <details>
 <summary>Initial setup</summary>
 
 1. Open the web interface and create your login credentials.
-2. Go to **Settings → AI Services** and configure an OpenAI-compatible API, such as OpenAI, Zhipu AI, DeepSeek, or Ollama.
-3. Go to **Settings → Notification Channels** and add Telegram or another delivery channel.
-4. Go to **Portfolio → Add Stock**, add a symbol to your watchlist, and enable the relevant agents.
+2. The main tour opens on first sign-in and follows stocks, quotes, AI setup and a first analysis. Required steps cannot be skipped; you can pause and resume. Reopen it from the **Guide center**, which also offers opportunities, paper trading, assistant, daily tasks and data sources, each with saved progress and replay. Click highlighted controls directly. The main tour verifies saved actions or successful checks; exploration routes record instructions you acknowledge.
+3. In the main tour, configure a service in **Settings → AI Services**, set the default model, and test the connection before explicitly generating your first analysis. This action uses your model quota; its result stays on the page.
+4. Optionally create a price alert and test a notification channel. You can defer or resume the guide; progress survives browser changes and service restarts. A changed model or channel configuration needs a new successful test.
+5. Enable scheduled agents or explore TradingAgents after the basics work. These are configured separately from the first analysis.
 
 </details>
 
@@ -101,6 +112,8 @@ services:
   panwatch:
     image: sunxiao0721/panwatch:latest
     container_name: panwatch
+    environment:
+      TZ: "Asia/Shanghai"
     ports:
       - "8000:8000"
     volumes:
@@ -114,6 +127,10 @@ volumes:
 ```bash
 docker compose up -d
 ```
+
+Change `environment.TZ` to your IANA timezone and run `docker compose up -d` to recreate
+the container. Review existing cron and quiet-hour wall times before changing it;
+the same `09:00` schedule will run at a different instant. Keep the data volume.
 
 </details>
 
@@ -153,6 +170,10 @@ Select the brain icon beside a holding to start TradingAgents deep analysis. Fou
 - Published 2026 closures and half-days are bundled locally. Startup warms only the previous 30 and next 90 days, without downloading full history. Unpublished weekdays show a pending calendar and block automatic execution; the bundled annual data must be updated for the next year.
 - Agent Cron/interval settings remain unchanged; execution and schedule previews share calendar filters. Price alerts in “all day” mode still require a trading day.
 - Paper fills require an open session for that stock's market. Paper notifications follow each exchange's local clock, including half-days and U.S. daylight-saving changes.
+- Mainland China paper positions follow T+1 using the Shanghai purchase date: automatic and manual sells are blocked on the purchase date and allowed from the next trading day, without waiting 24 hours. Prices and unrealized P&L continue updating while locked; stop-loss, take-profit and other exit conditions are checked again when selling becomes available, using the then-current quote.
+- Paper cash settlement is separate from sell eligibility: A shares settle T+1 and allow sale proceeds to fund new purchases immediately; HK (T+2) and US (T+1) use a cash account that only buys with settled, unreserved funds. The page shows cash balance, buying power, settled available cash and outstanding sale proceeds. Purchases reserve cash immediately; settlement changes availability without crediting cash or P&L again.
+- Settlement dates use each market's local calendar. HK half-days are non-settlement days; US Columbus Day and Veterans Day also defer settlement even when stocks trade. The simulation releases funds at the start of the due date, rather than modeling intraday clearing batches, withdrawal cutoffs, margin, FX or broker-specific facilities. Existing balances are treated as settled opening funds; historical trades are not retroactively locked. Unknown future calendars keep new outstanding proceeds pending until calendar data is updated.
+- Rule references: [HKEX settlement and half-days](https://www.hkex.com.hk/-/media/HKEX-Market/Services/Circulars-and-Notices/Participant-and-Members-Circulars/SEHK/2025/ce_SEHK_CT_075_2025.pdf), [SEC T+1](https://www.sec.gov/exams/educationhelpguidesfaqs/t1-faq), [DTC 2026 holidays](https://www.dtcc.com/-/media/Files/pdf/2025/10/15/23034-25.pdf).
 
 </details>
 
@@ -186,7 +207,7 @@ Select the brain icon beside a holding to start TradingAgents deep analysis. Fou
 | `AUTH_PASSWORD` | Preconfigured login password | Set on first visit |
 | `JWT_SECRET` | Secret used to sign JWTs | Generated automatically |
 | `DATA_DIR` | Data storage directory | `./data` |
-| `TZ` | Application timezone for Agent schedules; market-calendar times follow the browser timezone | `Asia/Shanghai` |
+| `TZ` | Deployment timezone for Agent schedules and notification quiet hours; interface display/input use the browser timezone | `Asia/Shanghai` |
 | `PLAYWRIGHT_SKIP_BROWSER_INSTALL` | Skip the initial Chromium installation when browser features are not required | Not set |
 | `LOG_LEVEL` | Console log level. `INFO` prints business events and errors; use `DEBUG` for scheduler heartbeats, collection steps, and other diagnostics. The UI log panel always retains the complete log. | `INFO` |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `http_proxy` | Outbound HTTP proxy. Configure it through an external environment variable, `http_proxy=http://host:port` in `.env`, or **Settings → Global HTTP Proxy**. Priority: external environment variables > UI > `.env`. `NO_PROXY` includes `localhost,127.0.0.1` by default. | Not set |
@@ -295,15 +316,7 @@ For sponsorship or partnership inquiries, contact [sunxiaoyes@outlook.com](mailt
 PanWatch is free and open source. If it saves you time or improves your workflow, you can support continued development:
 
 [![PayPal](https://img.shields.io/badge/PayPal-Donate-0070BA?logo=paypal&logoColor=white&style=for-the-badge)](https://paypal.me/sunxiaoyes)
-
-<details>
-<summary>USDT (TRC20)</summary>
-
-Address: `TKBV69B2AoU67p3vDhnJUbMJtZ1DxuUF5C`
-
-<img src="./docs/donate/binance.png" width="220" alt="Binance USDT TRC20 QR code" />
-
-</details>
+[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/sunxiao)
 
 <details>
 <summary>Alipay / WeChat Pay</summary>
@@ -311,6 +324,21 @@ Address: `TKBV69B2AoU67p3vDhnJUbMJtZ1DxuUF5C`
 | Alipay | WeChat Pay |
 |:---:|:---:|
 | <img src="./docs/donate/alipay.png" width="160" alt="Alipay QR code" /> | <img src="./docs/donate/wechat.png" width="160" alt="WeChat Pay QR code" /> |
+
+</details>
+
+<details>
+<summary>USDT</summary>
+
+**Binance Pay** — scan with the Binance app:
+
+<img src="./docs/donate/binance.png" width="220" alt="Binance Pay QR code" />
+
+**On-chain USDT (TRC20)** — scan with any TRON wallet:
+
+Address: `TKBV69B2AoU67p3vDhnJUbMJtZ1DxuUF5C`
+
+<img src="./docs/donate/trc20.png" width="220" alt="USDT TRC20 address QR code" />
 
 </details>
 

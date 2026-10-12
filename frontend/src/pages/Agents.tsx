@@ -11,6 +11,7 @@ import { useToast } from '@panwatch/base-ui/components/ui/toast'
 import { useTranslation } from 'react-i18next'
 import { localizeAgentDescription, localizeAgentName } from '@/i18n/agent-labels'
 import { getCurrentLocale } from '@/i18n'
+import { browserTimezone } from '@panwatch/base-ui'
 
 interface AgentConfig {
   id: number
@@ -23,6 +24,11 @@ interface AgentConfig {
   ai_model_id: number | null
   notify_channel_ids: number[]
   config: Record<string, unknown>
+}
+
+function timeoutValue(value: unknown, fallback: number, min: number, max: number): number {
+  const number = value === '' || value == null ? fallback : Number(value)
+  return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.trunc(number))) : fallback
 }
 
 interface StockAgentInfo {
@@ -190,12 +196,12 @@ export default function AgentsPage() {
 
   const { toast } = useToast()
 
-  const formatPreviewTime = (iso: string, tz?: string): string => {
+  const formatPreviewTime = (iso: string): string => {
     try {
       const d = new Date(iso)
       if (isNaN(d.getTime())) return iso
       return d.toLocaleString(getCurrentLocale(), {
-        timeZone: tz || undefined,
+        timeZone: browserTimezone(),
         month: '2-digit',
         day: '2-digit',
         hour: '2-digit',
@@ -455,9 +461,19 @@ export default function AgentsPage() {
   const saveTaConfig = async () => {
     if (!taConfigAgent) return
     try {
+      // llm_max_tokens is a legacy setting. Keep accepting it in imported/old
+      // configs, but stop persisting or forwarding the output cap.
+      const configWithoutOutputCap = { ...taConfigForm }
+      delete configWithoutOutputCap.llm_max_tokens
+      const config = {
+        ...configWithoutOutputCap,
+        timeout_minutes: timeoutValue(taConfigForm.timeout_minutes, 30, 1, 60),
+        llm_timeout_seconds: timeoutValue(taConfigForm.llm_timeout_seconds, 300, 1, 900),
+        collection_timeout_seconds: timeoutValue(taConfigForm.collection_timeout_seconds, 45, 5, 300),
+      }
       await fetchAPI(`/agents/${taConfigAgent.name}`, {
         method: 'PUT',
-        body: JSON.stringify({ config: taConfigForm }),
+        body: JSON.stringify({ config }),
       })
       toast(configT('messages.configSaved'), 'success')
       setTaConfigAgent(null)
@@ -551,7 +567,7 @@ export default function AgentsPage() {
                       <Badge variant="secondary" className="text-[10px]">{modeLabel}</Badge>
                       <button
                         type="button"
-                        onClick={() => openBindDialog(agent)}
+                        data-tour="agent-binding" onClick={() => openBindDialog(agent)}
                         className={`max-w-[320px] truncate px-2 py-0.5 rounded-md border text-[11px] transition-colors ${
                           boundStocks.length > 0
                             ? 'bg-primary/12 border-primary/35 text-primary hover:bg-primary/18'
@@ -567,11 +583,11 @@ export default function AgentsPage() {
                     {/* 执行周期 - 可点击编辑 */}
                     <div className="flex items-center gap-2.5 mt-3.5 ml-[22px] flex-wrap">
                       <button
-                        onClick={() => openScheduleDialog(agent)}
+                        data-tour="agent-schedule" onClick={() => openScheduleDialog(agent)}
                         className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-accent/50 hover:bg-accent transition-colors"
                       >
                         <Clock className="w-3.5 h-3.5 text-muted-foreground" />
-                        <span className="text-[12px] text-foreground">{formatSchedule(agent.schedule, configT)}</span>
+                        <span className="text-[12px] text-foreground">{formatSchedule(agent.schedule, configT)} {health?.timezone ? `(${health.timezone})` : ''}</span>
                         <Settings2 className="w-3 h-3 text-muted-foreground/50" />
                       </button>
                       {agent.name === 'tradingagents' && (
@@ -600,11 +616,11 @@ export default function AgentsPage() {
                             className="px-1.5 py-0.5 rounded border border-border/60 bg-accent/30 font-mono"
                             title={t}
                           >
-                            {formatPreviewTime(t, (preview as SchedulePreview).timezone)}
+                            {formatPreviewTime(t)}
                           </span>
                         ))}
                         {(preview as SchedulePreview).timezone ? (
-                          <span className="opacity-60">({(preview as SchedulePreview).timezone})</span>
+                          <span className="opacity-60">({browserTimezone()})</span>
                         ) : null}
                       </div>
                     ) : null}
@@ -749,12 +765,13 @@ export default function AgentsPage() {
 
       {/* 调度设置弹窗 */}
       <Dialog open={!!scheduleDialogAgent} onOpenChange={open => !open && setScheduleDialogAgent(null)}>
-        <DialogContent>
+        <DialogContent data-tour="agent-schedule-dialog"><div data-tour-instructions />
           <DialogHeader>
             <DialogTitle>{configT('schedule.title')}</DialogTitle>
             <DialogDescription>{agentName(scheduleDialogAgent)}</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 mt-2">
+            {(schedulePreview as SchedulePreview | null)?.timezone || health?.timezone ? <p className="text-[12px] text-muted-foreground">{configT('schedule.timezoneHint', { timezone: (schedulePreview as SchedulePreview | null)?.timezone || health?.timezone })}</p> : null}
             <div>
               <Label>{configT('schedule.type')}</Label>
               <Select
@@ -843,11 +860,11 @@ export default function AgentsPage() {
                       className="px-1.5 py-0.5 rounded border border-border/60 bg-background/40 font-mono"
                       title={t}
                     >
-                      {formatPreviewTime(t, (schedulePreview as SchedulePreview).timezone)}
+                      {formatPreviewTime(t)}
                     </span>
                   ))}
                   {(schedulePreview as SchedulePreview | null)?.timezone ? (
-                    <span className="opacity-60">({(schedulePreview as SchedulePreview).timezone})</span>
+                    <span className="opacity-60">({browserTimezone()})</span>
                   ) : null}
                 </div>
               ) : (
@@ -867,7 +884,7 @@ export default function AgentsPage() {
       </Dialog>
 
       <Dialog open={!!bindDialogAgent} onOpenChange={(open) => !open && setBindDialogAgent(null)}>
-        <DialogContent>
+        <DialogContent data-tour="agent-binding-dialog"><div data-tour-instructions />
           <DialogHeader>
             <DialogTitle>
               {bindDialogAgent ? configT('binding.titleWithAgent', { agent: agentName(bindDialogAgent) }) : configT('binding.title')}
@@ -1029,10 +1046,11 @@ export default function AgentsPage() {
             {/* 执行参数 */}
             <section>
               <div className="font-medium mb-2">{configT('advanced.executionSettings')}</div>
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
-                  <Label className="text-[12px]">{configT('advanced.debateRounds')}</Label>
+                  <Label htmlFor="ta-debate-rounds" className="text-[12px]">{configT('advanced.debateRounds')}</Label>
                   <Input
+                    id="ta-debate-rounds"
                     type="number"
                     min={1}
                     max={5}
@@ -1041,14 +1059,43 @@ export default function AgentsPage() {
                   />
                 </div>
                 <div>
-                  <Label className="text-[12px]">{configT('advanced.timeout')}</Label>
+                  <Label htmlFor="ta-run-timeout" className="text-[12px]">{configT('advanced.timeout')}</Label>
                   <Input
+                    id="ta-run-timeout"
                     type="number"
                     min={1}
                     max={60}
-                    value={String(taConfigForm.timeout_minutes ?? 15)}
-                    onChange={e => setTaConfigForm({ ...taConfigForm, timeout_minutes: parseInt(e.target.value) || 15 })}
+                    aria-describedby="ta-run-timeout-hint"
+                    value={String(taConfigForm.timeout_minutes ?? 30)}
+                    onChange={e => setTaConfigForm({ ...taConfigForm, timeout_minutes: e.target.value === '' ? '' : Number(e.target.value) })}
                   />
+                  <p id="ta-run-timeout-hint" className="mt-1 text-[11px] text-muted-foreground">{configT('advanced.timeoutHint')}</p>
+                </div>
+                <div>
+                  <Label htmlFor="ta-llm-timeout" className="text-[12px]">{configT('advanced.llmTimeout')}</Label>
+                  <Input
+                    id="ta-llm-timeout"
+                    type="number"
+                    min={1}
+                    max={900}
+                    aria-describedby="ta-llm-timeout-hint"
+                    value={String(taConfigForm.llm_timeout_seconds ?? 300)}
+                    onChange={e => setTaConfigForm({ ...taConfigForm, llm_timeout_seconds: e.target.value === '' ? '' : Number(e.target.value) })}
+                  />
+                  <p id="ta-llm-timeout-hint" className="mt-1 text-[11px] text-muted-foreground">{configT('advanced.llmTimeoutHint')}</p>
+                </div>
+                <div>
+                  <Label htmlFor="ta-collection-timeout" className="text-[12px]">{configT('advanced.collectionTimeout')}</Label>
+                  <Input
+                    id="ta-collection-timeout"
+                    type="number"
+                    min={5}
+                    max={300}
+                    aria-describedby="ta-collection-timeout-hint"
+                    value={String(taConfigForm.collection_timeout_seconds ?? 45)}
+                    onChange={e => setTaConfigForm({ ...taConfigForm, collection_timeout_seconds: e.target.value === '' ? '' : Number(e.target.value) })}
+                  />
+                  <p id="ta-collection-timeout-hint" className="mt-1 text-[11px] text-muted-foreground">{configT('advanced.collectionTimeoutHint')}</p>
                 </div>
               </div>
             </section>

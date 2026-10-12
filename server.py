@@ -760,6 +760,7 @@ def load_watchlist_for_agent(agent_name: str) -> list[StockConfig]:
                     symbol=s.symbol,
                     name=s.name,
                     market=market,
+                    asset_type=s.asset_type,
                 )
             )
         return result
@@ -1327,12 +1328,12 @@ async def trigger_agent(agent_name: str) -> str:
                 )
                 return result.content
         except Exception as e:
-            from src.platform.ai.errors import safe_ai_error_message
+            from src.platform.ai.errors import diagnostic_ai_error_message
 
             record_agent_run(
                 agent_name=agent_name,
                 status="failed",
-                error=safe_ai_error_message(e),
+                error=diagnostic_ai_error_message(e),
                 duration_ms=int((time.monotonic() - start) * 1000),
                 trace_id=trace_id,
                 trigger_source="manual",
@@ -1381,6 +1382,7 @@ async def trigger_agent_for_stock(
         symbol=stock.symbol,
         name=stock.name,
         market=market,
+        asset_type=getattr(stock, "asset_type", None),
     )
 
     # 加载该股票的持仓信息
@@ -1451,12 +1453,12 @@ async def trigger_agent_for_stock(
                 model_label=context.model_label,
             )
         except Exception as e:
-            from src.platform.ai.errors import safe_ai_error_message
+            from src.platform.ai.errors import diagnostic_ai_error_message
 
             record_agent_run(
                 agent_name=agent_name,
                 status="failed",
-                error=safe_ai_error_message(e),
+                error=diagnostic_ai_error_message(e),
                 duration_ms=int((time.monotonic() - start) * 1000),
                 trace_id=trace_id,
                 trigger_source="manual",
@@ -1485,6 +1487,9 @@ async def trigger_agent_for_stock(
 async def lifespan(app):
     """应用生命周期: 初始化 + 启动调度器"""
     init_db()
+    from src.modules.administration.onboarding import recover_interrupted_analysis
+    with SessionLocal() as setup_db:
+        recover_interrupted_analysis(setup_db)
     setup_logging()
     # OTel 导出(可选,默认关闭):仅当配置了 OTEL_EXPORTER_OTLP_ENDPOINT 且装了
     # opentelemetry SDK 时启用,否则静默 no-op,不影响现有部署。

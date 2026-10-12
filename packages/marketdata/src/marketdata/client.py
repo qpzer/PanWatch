@@ -163,6 +163,9 @@ class MarketData:
             # 继续降级到能覆盖全量的源，避免批量请求里特殊标的被静默丢弃
             resp = self._quote_engine.fetch(req, min_count=len(syms))
             if resp.ok and resp.data:
+                for quote in resp.data:
+                    if not quote.source:
+                        quote.source = resp.vendor
                 out.extend(resp.data)
         return out
 

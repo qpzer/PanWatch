@@ -68,12 +68,17 @@
 | **消息推送** | 通过 Telegram、企业微信、钉钉、飞书、Bark 或 Webhook 接收报告和提醒。 |
 | **移动端** | 将 PWA 添加到主屏幕，在手机上使用同一套工作台。 |
 
+A 股、港股和美股的股票与场内 ETF 共用搜索、自选、持仓、价格提醒、行情和 K 线流程。可按代码或名称搜索，例如 `510300`、`159915`、`02800`、`SPY`。标的类型会随自选保存；数据源名称未标明 ETF 的基金，可在选中后将类型设为 **ETF**。
+
+ETF 深度分析使用基金上下文，不套用上市公司的财报。基金成分、净值、费用和跟踪误差暂未接入结构化数据。模拟盘沿用既有市场规则与成本模型，尚未模拟 ETF 专属 T+0 例外和费率。
+
 ## 快速开始
 
 ```bash
 docker run -d \
   --name panwatch \
   --restart unless-stopped \
+  -e TZ=Asia/Shanghai \
   -p 8000:8000 \
   -v panwatch_data:/app/data \
   sunxiao0721/panwatch:latest
@@ -81,13 +86,18 @@ docker run -d \
 
 访问 `http://localhost:8000`，创建登录账号。
 
+通过 `TZ` 指定后台调度与通知静默时段的时区，例如 `-e TZ=UTC` 或
+`-e TZ=America/New_York`。镜像默认使用 `Asia/Shanghai`，不会自动读取宿主机时区。
+页面时间展示与提醒到期输入采用浏览器时区。[时区规则](docs/timezones.zh-CN.md)
+
 <details>
 <summary>首次配置</summary>
 
 1. 访问 Web 界面，设置登录账号
-2. **设置 → AI 服务商**：配置 OpenAI 兼容 API（支持 OpenAI / 智谱 / DeepSeek / Ollama 等）
-3. **设置 → 通知渠道**：添加 Telegram 或其他推送渠道
-4. **持仓 → 添加股票**：添加自选股，启用对应 Agent
+2. 首次登录自动进入主流程，按自选、行情、AI、首次分析顺序完成；必做步骤不可跳过，可以暂停续接。随时从**引导中心**重新进入，中心还提供机会、模拟盘、助手、日常任务和数据源路线，各自保存进度，完成后可重走。直接点击高亮控件：主流程核验真实保存或测试结果，探索路线记录你确认已了解的提示
+3. 主流程中，在**设置 → AI 服务商**配置服务、选择默认模型并测试连接，再主动生成首次分析；这会使用模型额度，结果在页面展示
+4. 可选配置价格提醒和测试通知渠道。引导支持稍后处理和恢复，换浏览器或重启服务后保留进度；模型或渠道配置变更后需要重新测试
+5. 基础流程跑通后，再配置定时 Agent 或体验 TradingAgents 深度分析，它们独立于首次分析设置
 
 </details>
 
@@ -99,6 +109,8 @@ services:
   panwatch:
     image: sunxiao0721/panwatch:latest
     container_name: panwatch
+    environment:
+      TZ: "Asia/Shanghai"
     ports:
       - "8000:8000"
     volumes:
@@ -112,6 +124,9 @@ volumes:
 ```bash
 docker compose up -d
 ```
+
+修改 `environment.TZ` 为所需 IANA 时区，再执行 `docker compose up -d` 重建容器。
+修改前核对已有 cron 和静默时段：同样的 `09:00` 将对应不同时间点。保留数据卷。
 
 </details>
 
@@ -151,6 +166,10 @@ docker compose up -d
 - 应用内置 2026 年公布的休市日与半日市；启动只预热过去 30 天、未来 90 天，不请求全历史日历。未公布年份的工作日显示日历待更新，并暂停自动执行；跨年前需补充下一年度数据。
 - 保留已配置的 Agent Cron / 间隔，执行与时间预览共用交易日过滤。价格提醒的“全天”也只在交易日生效。
 - 模拟盘成交必须处于对应股票市场的交易时段；模拟盘通知按各交易所当地时间调度，兼容半日市与美股夏令时变化。
+- A 股模拟持仓遵循 T+1：按上海时区的买入日期计算，当日买入不可自动或手动卖出，下一交易日起可卖，无需等满 24 小时。锁定期间继续更新行情和浮盈亏；止损、止盈及其他退出条件在可卖时重新检查，按当时行情成交。
+- 模拟资金交收与可卖规则分别计算：A 股 T+1 交收，卖出款当日可继续买入；港股 T+2、美股 T+1，按现金账户策略，仅用已交收且未占用的资金买入。页面区分现金余额、购买力、已交收可用资金与待交收卖出款。买入时立即占用资金；交收仅释放可用额度，不重复增加现金或盈亏。
+- 交收日期按市场当地日历计算：港股半日市不交收，美股 Columbus Day 和 Veterans Day 即使交易也不交收。模拟在交收日期开始时释放资金，不模拟日内清算批次、提现截止时间、融资、换汇或券商垫资。已有余额视为已交收期初资金，不追溯锁定历史成交；后续日历未更新时，新待交收款继续保持待交收状态。
+- 规则依据：[港交所交收及半日市安排](https://www.hkex.com.hk/-/media/HKEX-Market/Services/Circulars-and-Notices/Participant-and-Members-Circulars/SEHK/2025/ce_SEHK_CT_075_2025.pdf)、[美国 SEC T+1](https://www.sec.gov/exams/educationhelpguidesfaqs/t1-faq)、[DTC 2026 年交收假期](https://www.dtcc.com/-/media/Files/pdf/2025/10/15/23034-25.pdf)。
 
 </details>
 
@@ -184,7 +203,7 @@ docker compose up -d
 | `AUTH_PASSWORD` | 预设登录密码 | 首次访问时设置 |
 | `JWT_SECRET` | JWT 签名密钥 | 自动生成 |
 | `DATA_DIR` | 数据存储目录 | `./data` |
-| `TZ` | Agent 调度的应用时区；交易日历时间按浏览器时区展示 | `Asia/Shanghai` |
+| `TZ` | 后台 Agent 调度与通知静默时段的部署时区；页面展示和输入采用浏览器时区 | `Asia/Shanghai` |
 | `PLAYWRIGHT_SKIP_BROWSER_INSTALL` | 跳过首次 Chromium 安装（不需要截图时可用） | 未设置 |
 | `LOG_LEVEL` | 控制台日志级别。默认 `INFO`（只输出业务事件 + 错误）；排查问题时设 `DEBUG` 可看到调度心跳、采集过程等底层日志。UI 日志板始终保留完整记录，不受影响 | `INFO` |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `http_proxy` | 出站 HTTP 代理。三种配置方式任选其一: ① 启动前 `export HTTP_PROXY=...`；② `.env` 里写 `http_proxy=http://host:port`；③ UI「设置 → 全局 HTTP 代理」。三者优先级:外部环境变量 > UI > `.env`。生效后所有 httpx 客户端走代理。`NO_PROXY` 默认包含 `localhost,127.0.0.1` | 未设置 |
@@ -292,15 +311,7 @@ Langfuse / Tempo 同理,把 `OTEL_EXPORTER_OTLP_ENDPOINT` 指向对应 OTLP 入�
 PanWatch 完全免费开源。如果它节省了你的时间或改善了工作流，欢迎支持项目持续开发：
 
 [![PayPal](https://img.shields.io/badge/PayPal-Donate-0070BA?logo=paypal&logoColor=white&style=for-the-badge)](https://paypal.me/sunxiaoyes)
-
-<details>
-<summary>USDT（TRC20）</summary>
-
-地址：`TKBV69B2AoU67p3vDhnJUbMJtZ1DxuUF5C`
-
-<img src="./docs/donate/binance.png" width="220" alt="币安 USDT TRC20 二维码" />
-
-</details>
+[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/sunxiao)
 
 <details>
 <summary>支付宝 / 微信支付</summary>
@@ -308,6 +319,21 @@ PanWatch 完全免费开源。如果它节省了你的时间或改善了工作�
 | 支付宝 | 微信支付 |
 |:---:|:---:|
 | <img src="./docs/donate/alipay.png" width="160" alt="支付宝二维码" /> | <img src="./docs/donate/wechat.png" width="160" alt="微信支付二维码" /> |
+
+</details>
+
+<details>
+<summary>USDT</summary>
+
+**币安 Pay**（币安 App 内扫码转账）：
+
+<img src="./docs/donate/binance.png" width="220" alt="币安 Pay 收款码" />
+
+**链上 USDT（TRC20）**——任意 TRON 钱包扫码：
+
+地址：`TKBV69B2AoU67p3vDhnJUbMJtZ1DxuUF5C`
+
+<img src="./docs/donate/trc20.png" width="220" alt="USDT TRC20 地址二维码" />
 
 </details>
 
