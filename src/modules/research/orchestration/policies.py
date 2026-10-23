@@ -40,6 +40,8 @@ def validate_config(config, agent_name):
     template = template_for(config, agent_name)
     config.pop("template", None)
     config.pop("profile", None)
+    # 由 service.execute 消费的本地开关,非 ResearchPolicy 字段,避免校验/UI 保存报错。
+    config.pop("disable_thinking", None)
     if "graph" in config:
         raise ValueError("select the graph through a validated template")
     defaults = {"profile": PROFILES[agent_name]}

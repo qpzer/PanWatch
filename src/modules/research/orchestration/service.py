@@ -50,6 +50,8 @@ class Events:
 
 
 async def execute(agent, context, config):
+    config = dict(config or {})
+    disable_thinking = bool(config.pop("disable_thinking", False))
     mode, policy = validate_config(config, agent.name)
     keys = sorted(f"{s.market.value}:{s.symbol}" for s in context.watchlist)
     scope = hashlib.sha256(json.dumps(keys).encode()).hexdigest()
@@ -78,7 +80,9 @@ async def execute(agent, context, config):
         if remaining <= 0:
             raise TimeoutError("Research preparation exhausted the deadline")
         policy = policy.model_copy(update={"deadline_seconds": remaining})
-        research = await InvestmentResearch().run(prepared, model=ResearchModelGateway(context.ai_client),
+        gateway = ResearchModelGateway(context.ai_client)
+        gateway.disable_thinking = disable_thinking
+        research = await InvestmentResearch().run(prepared, model=gateway,
             tools=EvidenceTools(details), events=Events(run_id), policy=policy)
         result = present(agent, context, prepared, research, elapsed_seconds=time.monotonic() - started,
                          quantity_target_pct=config.get("position_target_pct"))

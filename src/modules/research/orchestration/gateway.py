@@ -9,6 +9,7 @@ from src.platform.ai.ai_failover import _mark_fail, _mark_ok, classify_ai_error,
 class ResearchModelGateway:
     def __init__(self, client):
         self.client = client
+        self.disable_thinking = False
 
     async def complete(self, *, role, messages, tools, schema, max_output_tokens, timeout, before_attempt):
         candidates = self.client._iter_candidates() if hasattr(self.client, "_iter_candidates") else [(self.client, self.client.model)]
@@ -22,6 +23,8 @@ class ResearchModelGateway:
                 if remaining <= 0:
                     raise TimeoutError("research model deadline")
                 kwargs = {"model": client.model, "messages": messages, "max_tokens": max_output_tokens}
+                if self.disable_thinking and "qwen" in client.model.lower():
+                    kwargs["extra_body"] = {"enable_thinking": False}
                 if client.model.startswith("glm-5.3"):
                     kwargs["reasoning_effort"] = "low"
                     if not tools:
