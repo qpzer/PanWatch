@@ -171,7 +171,18 @@ def save_agent_context_run(
     analysis_date: str,
     context_payload: dict,
     quality: dict | None = None,
+    db_session=None,
 ) -> bool:
+    if db_session is not None:
+        # 编排层单事务路径：由调用方管理提交/回滚，不做锁重试。
+        return _save_agent_context_run_once(
+            agent_name=agent_name,
+            stock_symbol=stock_symbol,
+            analysis_date=analysis_date,
+            context_payload=context_payload,
+            quality=quality,
+            db_session=db_session,
+        )
     try:
         run_with_lock_retry(
             lambda: _save_agent_context_run_once(
@@ -196,8 +207,10 @@ def _save_agent_context_run_once(
     analysis_date: str,
     context_payload: dict,
     quality: dict | None,
-) -> None:
-    db = SessionLocal()
+    db_session=None,
+) -> bool:
+    """save_agent_context_run 的单次执行体；传入 db_session 时由调用方管理事务。"""
+    db = db_session if db_session is not None else SessionLocal()
     try:
         payload_safe = to_jsonable(context_payload or {})
         quality_safe = to_jsonable(quality or {})
@@ -210,12 +223,16 @@ def _save_agent_context_run_once(
                 quality=quality_safe,
             )
         )
-        db.commit()
+        db.flush() if db_session is not None else db.commit()
+        return True
     except Exception:
+        if db_session is not None:
+            raise
         db.rollback()
         raise
     finally:
-        db.close()
+        if db_session is None:
+            db.close()
 
 
 def list_recent_agent_context_runs(
@@ -253,7 +270,25 @@ def save_agent_prediction_outcome(
     confidence: float | None = None,
     trigger_price: float | None = None,
     meta: dict | None = None,
+    db_session=None,
 ) -> bool:
+    if db_session is not None:
+        # 编排层单事务路径：由调用方管理提交/回滚，不做锁重试。
+        return _save_agent_prediction_outcome_once(
+            agent_name=agent_name,
+            stock_symbol=stock_symbol,
+            stock_market=stock_market,
+            prediction_date=prediction_date,
+            horizon_days=horizon_days,
+            action=action,
+            action_label=action_label,
+            prediction_group_id=prediction_group_id,
+            horizon_unit=horizon_unit,
+            confidence=confidence,
+            trigger_price=trigger_price,
+            meta=meta,
+            db_session=db_session,
+        )
     try:
         run_with_lock_retry(
             lambda: _save_agent_prediction_outcome_once(
@@ -292,8 +327,10 @@ def _save_agent_prediction_outcome_once(
     confidence: float | None,
     trigger_price: float | None,
     meta: dict | None,
-) -> None:
-    db = SessionLocal()
+    db_session=None,
+) -> bool:
+    """save_agent_prediction_outcome 的单次执行体；传入 db_session 时由调用方管理事务。"""
+    db = db_session if db_session is not None else SessionLocal()
     try:
         meta_safe = to_jsonable(meta or {})
         db.add(
@@ -313,12 +350,16 @@ def _save_agent_prediction_outcome_once(
                 meta=meta_safe,
             )
         )
-        db.commit()
+        db.flush() if db_session is not None else db.commit()
+        return True
     except Exception:
+        if db_session is not None:
+            raise
         db.rollback()
         raise
     finally:
-        db.close()
+        if db_session is None:
+            db.close()
 
 
 def mark_agent_prediction_outcome(

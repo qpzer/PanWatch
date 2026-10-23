@@ -83,6 +83,7 @@ def save_analysis(
     title: str = "",
     raw_data: dict | None = None,
     analysis_date: date | None = None,
+    db_session=None,
 ) -> bool:
     """
     保存分析结果
@@ -106,6 +107,12 @@ def save_analysis(
 
     date_str = analysis_date.strftime("%Y-%m-%d")
 
+    if db_session is not None:
+        # 编排层单事务路径：由调用方管理提交/回滚，不做锁重试。
+        return _save_analysis_once(
+            agent_name, stock_symbol, content, title, raw_data, date_str,
+            db_session=db_session,
+        )
     try:
         run_with_lock_retry(
             lambda: _save_analysis_once(
@@ -126,9 +133,10 @@ def _save_analysis_once(
     title: str,
     raw_data: dict | None,
     date_str: str,
-) -> None:
-    """save_analysis 的单次执行体，异常向上抛由调用方决定是否重试。"""
-    db = SessionLocal()
+    db_session=None,
+) -> bool:
+    """save_analysis 的单次执行体；传入 db_session 时由调用方管理事务。"""
+    db = db_session if db_session is not None else SessionLocal()
     try:
         payload = to_jsonable(raw_data or {})
         agent_kind = infer_agent_kind(agent_name)
@@ -161,12 +169,16 @@ def _save_analysis_once(
             db.add(record)
             logger.info(f"新增分析记录: {agent_name}/{stock_symbol}/{date_str}")
 
-        db.commit()
+        db.flush() if db_session is not None else db.commit()
+        return True
     except Exception:
+        if db_session is not None:
+            raise
         db.rollback()
         raise
     finally:
-        db.close()
+        if db_session is None:
+            db.close()
 
 
 def get_analysis(

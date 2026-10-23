@@ -59,6 +59,7 @@ def save_suggestion(
     stock_market: str = "CN",
     meta: dict | None = None,
     suggestion_state: dict | None = None,
+    db_session=None,
 ) -> bool:
     """
     保存 Agent 建议到建议池
@@ -84,6 +85,24 @@ def save_suggestion(
     }, agent_name=agent_name)
     action, action_label = normalized["action"], normalized["action_label"]
     meta = {**(meta or {}), "suggestion_state": extract_suggestion_state(normalized)}
+    if db_session is not None:
+        # 编排层单事务路径：由调用方管理提交/回滚，不做锁重试。
+        return _save_suggestion_once(
+            stock_symbol=stock_symbol,
+            stock_name=stock_name,
+            action=action,
+            action_label=action_label,
+            agent_name=agent_name,
+            signal=signal,
+            reason=reason,
+            agent_label=agent_label,
+            expires_hours=expires_hours,
+            prompt_context=prompt_context,
+            ai_response=ai_response,
+            stock_market=stock_market,
+            meta=meta,
+            db_session=db_session,
+        )
     try:
         run_with_lock_retry(
             lambda: _save_suggestion_once(
@@ -124,9 +143,10 @@ def _save_suggestion_once(
     ai_response: str,
     stock_market: str,
     meta: dict | None,
-) -> None:
-    """save_suggestion 的单次执行体，异常向上抛由调用方决定是否重试。"""
-    db = SessionLocal()
+    db_session=None,
+) -> bool:
+    """save_suggestion 的单次执行体；传入 db_session 时由调用方管理事务。"""
+    db = db_session if db_session is not None else SessionLocal()
     try:
         market = (stock_market or "CN").strip().upper() or "CN"
 
@@ -174,13 +194,15 @@ def _save_suggestion_once(
                         latest.expires_at = expires_at
                     if not (latest.stock_name or "") and stock_name:
                         latest.stock_name = stock_name
-                    db.commit()
+                    db.flush() if db_session is not None else db.commit()
                     logger.info(
                         f"建议去重: {stock_symbol} {action_label} (来源: {agent_label})"
                     )
                     return True
 
         except Exception:
+            if db_session is not None:
+                raise
             # Best-effort only; never block saving.
             db.rollback()
 
@@ -201,15 +223,19 @@ def _save_suggestion_once(
             meta=to_jsonable(meta or {}),
         )
         db.add(suggestion)
-        db.commit()
+        db.flush() if db_session is not None else db.commit()
 
         logger.info(f"保存建议: {stock_symbol} {action_label} (来源: {agent_label})")
 
+        return True
     except Exception:
+        if db_session is not None:
+            raise
         db.rollback()
         raise
     finally:
-        db.close()
+        if db_session is None:
+            db.close()
 
 
 def get_suggestions_for_stock(
