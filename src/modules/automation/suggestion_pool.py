@@ -190,7 +190,10 @@ def _save_suggestion_once(
 
                 if same_key and (now - latest_created) <= window:
                     # Extend expiry (keep the first message to avoid churn).
-                    if not latest.expires_at or latest.expires_at < expires_at:
+                    latest_expires = latest.expires_at
+                    if latest_expires is not None and latest_expires.tzinfo is None:
+                        latest_expires = latest_expires.replace(tzinfo=timezone.utc)
+                    if not latest_expires or latest_expires < expires_at:
                         latest.expires_at = expires_at
                     if not (latest.stock_name or "") and stock_name:
                         latest.stock_name = stock_name

@@ -66,6 +66,24 @@ def test_attention_is_separate_from_direction_and_notification_choice_is_kept(po
     assert latest['should_alert'] is False
 
 
+def test_dedupe_extends_expiry_across_sessions_without_tz_crash(pool):
+    # SQLite 读回的 expires_at 不带时区,与带时区的新值比较曾抛 TypeError 并中断落库。
+    common = dict(stock_symbol='588000', stock_name='科创50ETF', agent_name='intraday_monitor',
+                  signal='突破', reason='r', agent_label='盘中监测', expires_hours=8,
+                  prompt_context='', ai_response='', stock_market='CN',
+                  meta={'suggestion_state': 'ready'})
+    with pool() as s1:
+        assert suggestion_pool._save_suggestion_once(
+            action='buy', action_label='买入', db_session=s1, **common)
+        s1.commit()
+    with pool() as s2:
+        assert suggestion_pool._save_suggestion_once(
+            action='buy', action_label='买入', db_session=s2, **common)
+        s2.commit()
+    with pool() as db:
+        assert db.query(StockSuggestion).count() == 1
+
+
 
 
 

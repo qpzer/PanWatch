@@ -17,7 +17,7 @@ from src.platform.marketdata.models import MarketCode
 logger = logging.getLogger(__name__)
 
 # 腾讯日K接口(与 kline_collector.TENCENT_KLINE_URL 同源,本地化以解除对其内部符号的依赖)
-_TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+_TENCENT_KLINE_URL = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
 
 
 def _parse_tencent_kline(text: str, tencent_sym: str) -> list[KlineData]:
@@ -133,7 +133,7 @@ def _fetch_benchmark_series(code: str, days: int) -> tuple[list[str], list[float
     )[0]
     text = market_get(
         _TENCENT_KLINE_URL,
-        host_key="web.ifzq.gtimg.cn",
+        host_key="ifzq.gtimg.cn",
         params={"param": f"{tsym},day,,,{int(days)},qfq", "_var": "kline_dayqfq"},
         min_interval_s=0.15,
         parse="text",
