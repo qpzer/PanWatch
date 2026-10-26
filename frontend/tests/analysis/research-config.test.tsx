@@ -38,6 +38,25 @@ describe('validated research graph configuration', () => {
     expect(onClose).toHaveBeenCalledOnce()
   })
 
+  it('saves base weight and preserves local settings when switching templates', async () => {
+    const onSaved = vi.fn()
+    render(<ResearchConfigDialog agent={{ name: 'intraday_monitor', config: { research_graph: { disable_thinking: true } } }} onClose={vi.fn()} onSaved={onSaved} />)
+    const input = await screen.findByLabelText('单票基准仓位（%）') as HTMLInputElement
+    expect(input.value).toBe('10')
+    fireEvent.change(input, { target: { value: '0' } })
+    expect((screen.getByRole('button', { name: '保存', exact: true }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.change(input, { target: { value: '12.5' } })
+    fireEvent.keyDown(screen.getByRole('combobox', { name: '图模板' }), { key: 'ArrowDown' })
+    fireEvent.click(await screen.findByRole('option', { name: '完整研究图（自定义）' }))
+    expect(input.value).toBe('12.5')
+    fireEvent.click(screen.getByRole('button', { name: '保存', exact: true }))
+    await waitFor(() => expect(onSaved).toHaveBeenCalledOnce())
+    const call = vi.mocked(fetchAPI).mock.calls.find(([, options]) => options?.method === 'PUT')!
+    const body = JSON.parse(String(call[1]?.body))
+    expect(body.config.research_graph.position_target_pct).toBe(0.125)
+    expect(body.config.research_graph.disable_thinking).toBe(true)
+  })
+
   it('switches to the complete graph using server defaults and previews its mandatory review stages', async () => {
     await open()
     fireEvent.keyDown(screen.getByRole('combobox', { name: '图模板' }), { key: 'ArrowDown' })

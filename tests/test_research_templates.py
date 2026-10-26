@@ -103,6 +103,14 @@ def test_templates_validate_dependencies_and_preserve_explicit_global_budget_cap
     assert result.max_attempts == 5 and result.max_tools == 1
 
 
+def test_position_base_pct_is_a_validated_local_setting():
+    _, policy = validate_config({'template': 'intraday_fast', 'position_target_pct': 0.1}, 'intraday_monitor')
+    assert not hasattr(policy, 'position_target_pct')
+    for value in (0, 1.01, '10', True):
+        with pytest.raises(ValueError):
+            validate_config({'template': 'intraday_fast', 'position_target_pct': value}, 'intraday_monitor')
+
+
 def test_explicit_review_runs_without_price_trigger_and_baseline_failure_preserves_audit(host, monkeypatch, tmp_path):
     engine, _ = host
     monkeypatch.setenv('DATA_DIR', str(tmp_path))
@@ -119,7 +127,7 @@ def test_explicit_review_runs_without_price_trigger_and_baseline_failure_preserv
         assert len(db.scalars(select(AnalysisHistory)).all()) == 1
 
 
-def test_template_api_and_invalid_update_preserve_stored_config(host):
+def test_template_api_and_config_updates(host, monkeypatch):
     from src.modules.automation.api.agents import router
     from src.platform.persistence.database import get_db
     from src.platform.persistence.models import AgentConfig
@@ -138,6 +146,13 @@ def test_template_api_and_invalid_update_preserve_stored_config(host):
     with Session(engine) as db:
         row = db.scalars(select(AgentConfig).where(AgentConfig.name == 'intraday_monitor')).one()
         assert row.config['research_graph']['template'] == 'intraday_fast' and not row.config['research_graph'].get('debate', False)
+    monkeypatch.setattr('src.modules.automation.api.agents.request_scheduler_reload', lambda: None)
+    good = client.put('/agents/intraday_monitor', json={'config': {'research_graph': {'template': 'intraday_fast', 'position_target_pct': 0.1}}})
+    assert good.status_code == 200, good.text
+    assert good.json()['config']['research_graph']['position_target_pct'] == 0.1
+    with Session(engine) as db:
+        row = db.scalars(select(AgentConfig).where(AgentConfig.name == 'intraday_monitor')).one()
+        assert row.config['research_graph']['position_target_pct'] == 0.1
 
 
 def test_active_stock_captures_market_context_but_quiet_run_does_not(host, monkeypatch, tmp_path):

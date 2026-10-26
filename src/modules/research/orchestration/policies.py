@@ -42,6 +42,11 @@ def validate_config(config, agent_name):
     config.pop("profile", None)
     # 由 service.execute 消费的本地开关,非 ResearchPolicy 字段,避免校验/UI 保存报错。
     config.pop("disable_thinking", None)
+    target_pct = config.pop("position_target_pct", None)
+    if target_pct is not None and (
+        isinstance(target_pct, bool) or not isinstance(target_pct, (int, float)) or not 0 < target_pct <= 1
+    ):
+        raise ValueError("position_target_pct must be between 0 and 1")
     if "graph" in config:
         raise ValueError("select the graph through a validated template")
     defaults = {"profile": PROFILES[agent_name]}
