@@ -55,7 +55,10 @@ export default function ResearchConfigDialog({ agent, onClose, onSaved }: {
     if (!agent || !valid) return
     setSaving(true)
     try {
-      await fetchAPI(`/agents/${agent.name}`, { method: 'PUT', body: JSON.stringify({ config: { ...agent.config, research_graph: { ...value, position_target_pct: basePct / 100 } } }) })
+      const current = (agent.config.research_graph || {}) as Record<string, unknown>
+      const researchGraph: Record<string, unknown> = { ...value, position_target_pct: basePct / 100 }
+      if (!('max_input_chars' in current)) delete researchGraph.max_input_chars
+      await fetchAPI(`/agents/${agent.name}`, { method: 'PUT', body: JSON.stringify({ config: { ...agent.config, research_graph: researchGraph } }) })
       toast(key('saved'), 'success'); onSaved(); onClose()
     } catch (e) { toast(e instanceof Error ? e.message : key('failed'), 'error') }
     finally { setSaving(false) }

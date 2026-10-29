@@ -380,6 +380,15 @@ def test_multi_target_default_capacities_preserve_explicit_global_limits():
     assert service.scope_policy(default, {}, 30).max_total_tokens <= 1000000
 
 
+@pytest.mark.parametrize("agent_name", ["premarket_outlook", "daily_report"])
+def test_eight_target_input_capacity_scales_only_without_an_explicit_cap(agent_name):
+    _, policy = service.validate_config({}, agent_name)
+    assert service.scope_policy(policy, {}, 8).max_input_chars == 144000
+    config = {"max_input_chars": 60000}
+    _, explicit = service.validate_config(config, agent_name)
+    assert service.scope_policy(explicit, config, 8).max_input_chars == 60000
+
+
 def test_notification_starts_with_the_same_actions_saved_in_the_report(host, monkeypatch):
     from src.platform.notifications.notifier import sanitize_for_telegram
     engine, _ = host

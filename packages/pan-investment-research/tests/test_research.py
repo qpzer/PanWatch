@@ -371,16 +371,74 @@ def test_deadline_review_always_explains_why_research_stopped():
     assert all(r.reason and r.review_required for r in result.recommendations)
 
 
-def test_risk_can_verify_only_plan_citations_without_truncated_source_facts():
+def test_risk_uses_bounded_citations_without_mutating_source_evidence():
     data, model = prepared(), Model()
     data.evidence[0].content = {"document": "x" * 1000, "verified_level": 123.45}
     result = run(model, data)
     assert result.status == "ready"
     payload = next(p for role, p in model.payloads if role == "risk")
+    assert payload["input"]["evidence"] == []
     assert len(payload["cited_evidence"]) == 1
     assert payload["cited_evidence"][0]["id"] == data.evidence[0].id
-    assert payload["cited_evidence"][0]["content"]["verified_level"] == 123.45
-    assert payload["cited_evidence"][0]["content"]["document"] == "x" * 1000
+    assert len(payload["cited_evidence"][0]["content"]["preview"]) == 600
+    decision = next(p for role, p in model.payloads if role == "decision")
+    assert decision["input"]["evidence"] == []
+    stored = next(e for a in result.artifacts if a.role == "technical" for e in a.evidence if e.id == data.evidence[0].id)
+    assert stored.content == {"document": "x" * 1000, "verified_level": 123.45}
+
+
+@pytest.mark.parametrize("profile", ["premarket", "postmarket"])
+def test_large_tool_evidence_is_compacted_only_in_model_messages(profile):
+    data = prepared(tuple(f"CN:{600000 + index}" for index in range(8)))
+    data.evidence = [e for domain in ("events", "technical", "flow") for e in data.evidence if e.domain == domain]
+    for item in data.evidence:
+        if item.domain == "events":
+            item.content = {"document": "x" * 8000, "verified_level": 123.45}
+
+    class CheckingModel(Model):
+        def __init__(self):
+            super().__init__(tools=True)
+            self.initial_payloads = []
+            self.tool_messages = []
+
+        async def complete(self, *, role, messages, **kwargs):
+            if role == "events":
+                if self.calls[role]:
+                    self.tool_messages.extend(m for m in messages if m["role"] == "tool")
+                else:
+                    self.initial_payloads.append(json.loads(messages[1]["content"]))
+            return await super().complete(role=role, messages=messages, **kwargs)
+
+    model = CheckingModel()
+    policy = ResearchPolicy(profile=profile, specialists=["events"], debate=False, max_input_chars=30000)
+    result = run(model, data, policy, Tools(data))
+    assert result.completion == "complete", result.reason
+    assert len(result.recommendations) == 8
+    initial = model.initial_payloads[0]["input"]["evidence"]
+    assert len(initial) == 8 and all("preview" in e["content"] for e in initial)
+    assert len(model.tool_messages) == 1
+    tool_evidence = json.loads(model.tool_messages[0]["content"])
+    assert {e["id"] for e in tool_evidence} == {e.id for e in data.evidence if e.domain == "events"}
+    assert all(len(e["content"]["preview"]) == 600 for e in tool_evidence)
+    stored = [e for a in result.artifacts if a.role == "events" for e in a.evidence]
+    assert len(stored) == 8
+    assert all(e.content == {"document": "x" * 8000, "verified_level": 123.45} for e in stored)
+    risk = next(p for role, p in model.payloads if role == "risk")
+    decision = next(p for role, p in model.payloads if role == "decision")
+    assert risk["input"]["evidence"] == decision["input"]["evidence"] == []
+    assert len(risk["cited_evidence"]) == 8
+    assert all(len(e["content"]["preview"]) == 600 for e in risk["cited_evidence"])
+    strategy = next(a for a in result.artifacts if a.role == "strategy")
+    assert len(strategy.report.session_notes) == 8
+
+
+def test_role_input_budget_reports_role_size_and_limit():
+    result = run(policy=ResearchPolicy(max_input_chars=1000))
+    assert result.completion == "budget_exhausted"
+    assert result.reason.startswith("role input exceeds context budget: role=")
+    assert any(f"role={role} chars=" in result.reason for role in ("technical", "flow", "events"))
+    assert result.reason.endswith(" limit=1000")
+    assert result.usage["attempts"] == 0
 
 
 @pytest.mark.parametrize(("outlook", "action"), [

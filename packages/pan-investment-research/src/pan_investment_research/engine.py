@@ -52,13 +52,37 @@ def market_input(prepared):
     return value
 
 
+def compact_evidence(item):
+    value = item.model_dump(mode="json") if isinstance(item, Evidence) else dict(item)
+    content = json.dumps(value["content"], ensure_ascii=False)
+    if len(content) > 600:
+        value["content"] = {"preview": content[:600], "details": "See cited specialist findings; request targeted evidence if material"}
+    return value
+
+
 def compact_input(prepared):
     value = market_input(prepared)
-    for item in value["evidence"]:
-        content = json.dumps(item["content"], ensure_ascii=False)
-        if len(content) > 600:
-            item["content"] = {"preview": content[:600], "details": "See cited specialist findings; request targeted evidence if material"}
+    value["evidence"] = [compact_evidence(item) for item in value["evidence"]]
     return value
+
+
+def compact_tool_messages(messages, max_input_chars):
+    if len(json.dumps(messages, ensure_ascii=False)) <= max_input_chars:
+        return messages
+    result = []
+    for message in messages:
+        if message.get("role") != "tool":
+            result.append(message)
+            continue
+        try:
+            found = json.loads(message.get("content") or "")
+        except (TypeError, ValueError):
+            found = None
+        if not isinstance(found, list) or not all(isinstance(item, dict) and "id" in item and "content" in item for item in found):
+            result.append(message)
+            continue
+        result.append({**message, "content": json.dumps([compact_evidence(item) for item in found], ensure_ascii=False)})
+    return result
 
 
 class State(TypedDict, total=False):
@@ -171,8 +195,10 @@ class InvestmentResearch:
                   + json.dumps(schema, ensure_ascii=False))
         messages = ([{"role": "system", "content": prompt}, *messages[1:]] if messages else [
             {"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}])
-        if len(json.dumps(messages, ensure_ascii=False)) > deps.policy.max_input_chars:
-            raise BudgetExceeded("role input exceeds context budget")
+        messages = compact_tool_messages(messages, deps.policy.max_input_chars)
+        input_chars = len(json.dumps(messages, ensure_ascii=False))
+        if input_chars > deps.policy.max_input_chars:
+            raise BudgetExceeded(f"role input exceeds context budget: role={role} chars={input_chars} limit={deps.policy.max_input_chars}")
         permitted = False
 
         async def permit():
@@ -303,7 +329,8 @@ class InvestmentResearch:
             role = state["role"]
             prepared.portfolio = {}  # Market specialists do not assess account execution.
             prepared.evidence = [e for e in prepared.evidence if e.domain in {role, "market"}]
-            payload = {"input": market_input(prepared), "issues": state.get("issues", [])}
+            input_value = market_input(prepared) if deps.policy.graph == "intraday_fast" else compact_input(prepared)
+            payload = {"input": input_value, "issues": state.get("issues", [])}
             schemas = deps.tools.schemas(role) if deps.tools and state.get("rounds", 0) < deps.policy.max_tool_rounds else []
             reply, messages = await self._model(role, payload, deps, messages=state.get("messages"), tools=schemas)
             return {"reply": reply, "messages": messages, "prepared": prepared.model_dump(mode="json")}
@@ -363,7 +390,8 @@ class InvestmentResearch:
                 deps.repaired = True
                 messages = state["messages"] + [{"role": "assistant", "content": reply.content},
                     {"role": "user", "content": f"Repair the JSON contract without adding facts: {exc}"}]
-                reply, _ = await self._model(state["role"], {"input": market_input(prepared)}, deps, messages=messages)
+                input_value = market_input(prepared) if deps.policy.graph == "intraday_fast" else compact_input(prepared)
+                reply, _ = await self._model(state["role"], {"input": input_value}, deps, messages=messages)
                 report = RoleReport.model_validate_json(reply.content)
                 self._validate(report, prepared, prepared.evidence, state["role"])
             return self._store(state, state["role"], report, reply.model,
@@ -490,7 +518,10 @@ class InvestmentResearch:
             deps = runtime.context
             active = active_artifacts(state.get("artifacts", {}))
             rulings = {k: a for k, a in active.items() if a["role"] in {"manager", "risk"}}
-            payload = {"input": compact_input(deps.prepared), "research": rulings,
+            input_value = compact_input(deps.prepared)
+            if role in {"risk", "decision"}:
+                input_value["evidence"] = []
+            payload = {"input": input_value, "research": rulings,
                        "accepted_claims": [c for a in active.values() for c in a["report"]["claims"]
                            if c["id"] in {i for r in rulings.values() for i in r["report"]["accepted_claim_ids"]}],
                        "plan": state.get("plan", []), "issues": state.get("issues", [])}
@@ -498,7 +529,7 @@ class InvestmentResearch:
                 requested = {i for r in state.get("plan", []) for i in r["evidence_ids"]}
                 sources = {e.id: e for e in deps.prepared.evidence}
                 sources.update({e.id: e for a in deps.artifacts.values() for e in a.evidence})
-                payload["cited_evidence"] = [sources[i].model_dump(mode="json") for i in sorted(requested)]
+                payload["cited_evidence"] = [compact_evidence(sources[i]) for i in sorted(requested)]
             report, model = await self._report(role, payload, deps)
             if role in {"strategy", "decision"}:
                 if role == "strategy":

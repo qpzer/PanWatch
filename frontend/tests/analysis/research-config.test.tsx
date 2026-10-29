@@ -7,8 +7,8 @@ import { fetchAPI } from '@panwatch/api'
 
 vi.mock('@panwatch/api', () => ({ fetchAPI: vi.fn() }))
 const metadata = { default_template: 'intraday_fast', templates: [
-  { id: 'intraday_fast', graph: 'intraday_fast', allowed_specialists: ['technical', 'events'], defaults: { specialists: ['technical', 'events'], debate: false, debate_on: 'always', trigger_mode: 'changes', max_feedback: 0, max_attempts: 6, max_tools: 2, concurrency: 2, max_total_tokens: 80000, max_output_tokens: 1536, deadline_seconds: 45 } },
-  { id: 'custom_research', graph: 'research', allowed_specialists: ['technical', 'flow', 'events'], defaults: { specialists: ['technical'], debate: false, debate_on: 'always', trigger_mode: 'changes', max_feedback: 0, max_attempts: 10, max_tools: 2, concurrency: 2, max_total_tokens: 250000, max_output_tokens: 4096, deadline_seconds: 45 } },
+  { id: 'intraday_fast', graph: 'intraday_fast', allowed_specialists: ['technical', 'events'], defaults: { specialists: ['technical', 'events'], debate: false, debate_on: 'always', trigger_mode: 'changes', max_feedback: 0, max_attempts: 6, max_tools: 2, concurrency: 2, max_total_tokens: 80000, max_output_tokens: 1536, max_input_chars: 60000, deadline_seconds: 45 } },
+  { id: 'custom_research', graph: 'research', allowed_specialists: ['technical', 'flow', 'events'], defaults: { specialists: ['technical'], debate: false, debate_on: 'always', trigger_mode: 'changes', max_feedback: 0, max_attempts: 10, max_tools: 2, concurrency: 2, max_total_tokens: 250000, max_output_tokens: 4096, max_input_chars: 60000, deadline_seconds: 45 } },
 ] }
 const agent = { name: 'intraday_monitor', config: { unrelated: 'preserved' } }
 beforeEach(() => { vi.mocked(fetchAPI).mockReset(); vi.mocked(fetchAPI).mockImplementation(async (path) => path.includes('research-templates') ? structuredClone(metadata) : {}) })
@@ -35,6 +35,7 @@ describe('validated research graph configuration', () => {
     expect(body.config.research_graph.specialists).toEqual(['technical'])
     expect(body.config.research_graph.max_attempts).toBe(8)
     expect(body.config.research_graph.debate).toBe(false)
+    expect(body.config.research_graph).not.toHaveProperty('max_input_chars')
     expect(onClose).toHaveBeenCalledOnce()
   })
 
@@ -55,6 +56,18 @@ describe('validated research graph configuration', () => {
     const body = JSON.parse(String(call[1]?.body))
     expect(body.config.research_graph.position_target_pct).toBe(0.125)
     expect(body.config.research_graph.disable_thinking).toBe(true)
+    expect(body.config.research_graph).not.toHaveProperty('max_input_chars')
+  })
+
+  it('preserves an explicitly configured input cap', async () => {
+    const onSaved = vi.fn()
+    render(<ResearchConfigDialog agent={{ name: 'intraday_monitor', config: { research_graph: { max_input_chars: 45000 } } }} onClose={vi.fn()} onSaved={onSaved} />)
+    await screen.findByRole('switch', { name: '事件分析' })
+    fireEvent.click(screen.getByRole('button', { name: '保存', exact: true }))
+    await waitFor(() => expect(onSaved).toHaveBeenCalledOnce())
+    const call = vi.mocked(fetchAPI).mock.calls.find(([, options]) => options?.method === 'PUT')!
+    const body = JSON.parse(String(call[1]?.body))
+    expect(body.config.research_graph.max_input_chars).toBe(45000)
   })
 
   it('switches to the complete graph using server defaults and previews its mandatory review stages', async () => {
